@@ -1,11 +1,6 @@
+# Совместимость со старыми командами docker compose -f compose.yaml -f compose.semantic.yaml.
+# Модель хранится в томе /data/model; локальный каталог поверх неё не подключается.
 services:
   bot:
-    build:
-      target: semantic
     environment:
-      MODEL_DIR: /model
       TOKENIZERS_PARALLELISM: "false"
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-    volumes:
-      - ./model:/model:ro

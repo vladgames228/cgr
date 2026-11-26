@@ -1,5 +1,46 @@
 import hashlib
+import os
 from pathlib import Path
+from urllib.request import urlopen
+
+
+MODEL_FILES = {
+    'model.onnx': '98a01d88b7de996cdea58c32ca71208c09968d143798814b2ea09d3439dc334f',
+    'tokenizer.json': '2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8',
+}
+MODEL_BASE = ('https://huggingface.co/sentence-transformers/'
+              'paraphrase-multilingual-MiniLM-L12-v2/resolve/'
+              'e8f8c211226b894fcb81acc59f3b34ba3efd5f42/')
+
+
+def ensure_model(root):
+    """Keep verified weights in the persistent data volume, including across rebuilds."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    for name, expected in MODEL_FILES.items():
+        path = root / name
+        if path.exists():
+            existing = hashlib.sha256()
+            with path.open('rb') as handle:
+                while block := handle.read(1024 * 1024):
+                    existing.update(block)
+            if existing.hexdigest() == expected:
+                continue
+        temporary = root / (name + '.part')
+        temporary.unlink(missing_ok=True)
+        digest = hashlib.sha256()
+        try:
+            remote = 'onnx/model_quint8_avx2.onnx' if name == 'model.onnx' else name
+            with urlopen(MODEL_BASE + remote, timeout=60) as response, temporary.open('wb') as output:
+                while block := response.read(1024 * 1024):
+                    output.write(block)
+                    digest.update(block)
+            if digest.hexdigest() != expected:
+                raise ValueError(f'Контрольная сумма {name} не совпала')
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return root
 
 
 class Encoder:

@@ -113,14 +113,15 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user.await_count, 3)
 
     async def test_private_admin_only_and_settings_survive_restart(self):
-        transport = SimpleNamespace(configure=AsyncMock(return_value=self.route))
+        transport = SimpleNamespace(configure=AsyncMock(return_value=self.route),
+                                    count=AsyncMock(return_value=12))
         control = Control(self.archive, transport, '/model', admin_ids('123, 456'))
         for identifier, private in ((77, True), (123, False)):
             event = SimpleNamespace(sender_id=identifier, is_private=private, raw_text='/mode classic',
                                     respond=AsyncMock())
             await control.handle(event)
             event.respond.assert_not_awaited()
-        self.assertEqual(control.mode, 'minilm')
+        self.assertEqual(control.mode, 'classic')
         event = SimpleNamespace(sender_id=123, is_private=True, raw_text='/mode classic', respond=AsyncMock())
         await control.handle(event)
         event.respond.assert_awaited_once()
@@ -135,8 +136,10 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_backfill_preserves_existing_scores_and_can_disable(self):
         self.save_route()
+        self.archive.set_auto_publish(1, 1)
         self.archive.index(1, 7, '2025-01-01', 'Первое сообщение. И ещё один абзац.')
         previous = self.archive.next_job(1)
+        self.archive.set_setting('mode', 'minilm')
 
         class Encoder:
             identity = 'mini-test'
@@ -145,7 +148,8 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
                 return [[1, 2, 3] for _ in texts]
 
         control = Control(self.archive, None, '/model', {123})
-        with patch('uniqueness.control.Encoder', return_value=Encoder()):
+        with patch('uniqueness.control.Encoder', return_value=Encoder()), \
+             patch('uniqueness.control.ensure_model'):
             await control.warm_model()
         self.assertTrue(await control.index(1))
         self.assertIsNone(self.archive.missing_embedding(1))
@@ -175,6 +179,7 @@ class UpdateTests(unittest.IsolatedAsyncioTestCase):
         self.archive.save_route(1, 4, 5, [(i, 11) for i in (1, 4, 5, 5)], skip_pending=True)
         self.assertIsNone(self.archive.next_job(1))
         self.assertEqual(self.archive.state(1)['cursor'], 7)
+        self.archive.set_auto_publish(1, 1)
         self.archive.index(1, 8, '2025-01-02', 'Второе сообщение.')
         self.assertEqual(self.archive.next_job(1)['id'], 8)
 

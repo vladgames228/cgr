@@ -224,7 +224,8 @@ def compare(current, previous, scores):
     a, b = current['units'][0], previous['units'][0]
     scores[0] = max(scores[0], wording(a, b))
     scores[1] = max(scores[1], sparse_cosine(a['topic'], b['topic']))
-    dense = current['vectors'] @ previous['vectors'].T if 'vectors' in current else None
+    dense = (current['vectors'] @ previous['vectors'].T
+             if 'vectors' in current and 'vectors' in previous else None)
     scores[2] = max(scores[2], meaning(a, b, float(dense[0, 0]) if dense is not None else None))
     scores[3] = max(scores[3], style_similarity(a['style'], b['style']))
     if min(scores) >= 0.95:

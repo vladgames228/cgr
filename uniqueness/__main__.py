@@ -22,7 +22,7 @@ class Config:
     def __init__(self):
         self.data = Path(os.environ.get('DATA_DIR', './data'))
         self.data.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.model = os.environ.get('MODEL_DIR', '/model')
+        self.model = self.data / 'model'
 
     def credentials(self):
         self.api_id = int(os.environ['TG_API_ID'])
@@ -60,6 +60,10 @@ async def schedule(control, operation, idle, name):
                 delay = min(120, 2 ** min(failures[source], 7))
                 ready[source] = time.monotonic() + delay
                 LOG.warning('%s, источник %s: %s. Повтор через %s с', name, source, exc, delay)
+                try:
+                    await control.alert(source, name, exc)
+                except (OSError, sqlite3.Error, RetryLater, errors.RPCError) as alert_exc:
+                    LOG.warning('Уведомление об ошибке не доставлено: %s', alert_exc)
             else:
                 failures.pop(source, None)
                 ready[source] = time.monotonic() + (0 if work_remains else idle)
@@ -95,17 +99,34 @@ async def serve(config, check=False):
             await control.warm_model()
             return
         bot.add_event_handler(control.handle, events.NewMessage(incoming=True, func=lambda e: e.is_private))
+        bot.add_event_handler(control.handle_button, events.CallbackQuery())
 
         async def warm():
             try:
                 await control.warm_model()
             except (ValueError, OSError, RuntimeError):
                 LOG.exception('Не удалось загрузить MiniLM. Проверьте образ или переключитесь на /mode classic.')
+                for admin in admins:
+                    try:
+                        await telegram.call('bot', bot.send_message, admin,
+                                            f'⚠️ MiniLM не загрузилась: {control.model_error}. Открой /errors.')
+                    except (OSError, errors.RPCError, RetryLater):
+                        pass
 
-        async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(warm())
-            tasks.create_task(schedule(control, control.index, poll, 'Чтение'))
-            tasks.create_task(schedule(control, control.deliver, 2, 'Публикация'))
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(warm())
+                tasks.create_task(schedule(control, control.index, poll, 'Чтение'))
+                tasks.create_task(schedule(control, control.deliver, 2, 'Публикация'))
+        except Exception as exc:
+            LOG.exception('Основной процесс остановился')
+            for admin in admins:
+                try:
+                    await telegram.call('bot', bot.send_message, admin,
+                                        f'🚨 Бот остановился: {type(exc).__name__}: {str(exc)[:1200]}')
+                except (OSError, errors.RPCError, RetryLater):
+                    pass
+            raise
     finally:
         await asyncio.gather(user.disconnect(), bot.disconnect())
         archive.close()

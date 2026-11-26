@@ -5,3 +5,5 @@ model
 tests
 **/__pycache__
 .git
+.deps
+.venv

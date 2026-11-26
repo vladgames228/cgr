@@ -119,6 +119,10 @@ class Telegram:
         messages = await self.call('user', self.user.get_messages, source, limit=1)
         return messages[0].id if messages else 0
 
+    async def count(self, source):
+        messages = await self.call('user', self.user.get_messages, source, limit=0)
+        return messages.total
+
     async def history(self, source, after, head, limit):
         iterator = self.user.iter_messages(source, min_id=after, max_id=head + 1,
                                            reverse=True, limit=limit)
@@ -136,9 +140,9 @@ class Telegram:
         await asyncio.sleep(max(0, self.last_forwards + FORWARD_GAP - time.monotonic()))
         self.last_forwards = time.monotonic()
 
-    async def copy(self, route, post, random_id):
+    async def copy(self, route, post, random_id, *, reuse_copy=True):
         source, destination = route.source.channel_id, route.destination.channel_id
-        existing = self.archive.copied_id(source, destination, post)
+        existing = self.archive.copied_id(source, destination, post) if reuse_copy else None
         if existing is not None:
             return existing
         await self.pace_posts()
@@ -148,8 +152,9 @@ class Telegram:
         self.archive.store_copies(source, destination, copies)
         return copies[post]
 
-    async def forward(self, route, post, random_id):
-        existing = self.archive.copied_id(route.source.channel_id, route.destination.channel_id, post)
+    async def forward(self, route, post, random_id, *, reuse_copy=True):
+        existing = (self.archive.copied_id(route.source.channel_id, route.destination.channel_id, post)
+                    if reuse_copy else None)
         if existing is not None:
             return existing
         await self.pace_posts()
