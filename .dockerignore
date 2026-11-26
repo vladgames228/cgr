@@ -1,0 +1,7 @@
+.env
+channels.json
+data
+model
+tests
+**/__pycache__
+.git

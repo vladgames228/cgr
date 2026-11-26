@@ -1,0 +1,25 @@
+services:
+  bot:
+    build:
+      context: .
+      target: classic
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      CHANNELS_FILE: /config/channels.json
+    volumes:
+      - data:/data
+      - ./channels.json:/config/channels.json:ro
+    restart: unless-stopped
+    init: true
+    cpus: 2.0
+    mem_limit: 2g
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  data:

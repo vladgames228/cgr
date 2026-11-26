@@ -1,0 +1,6 @@
+.env
+channels.json
+data/
+model/
+__pycache__/
+.venv/
