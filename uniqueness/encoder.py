@@ -30,8 +30,11 @@ class Encoder:
         options = onnxruntime.SessionOptions()
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
-        self.session = onnxruntime.InferenceSession(str(model), sess_options=options,
-                                                    providers=['CPUExecutionProvider'])
+        try:
+            self.session = onnxruntime.InferenceSession(str(model), sess_options=options,
+                                                        providers=['CPUExecutionProvider'])
+        except Exception as exc:
+            raise RuntimeError(f'ONNX Runtime не загрузил MiniLM: {exc}') from exc
         self.inputs = {item.name for item in self.session.get_inputs()}
         self.output = 'last_hidden_state'
         if self.output not in {item.name for item in self.session.get_outputs()}:

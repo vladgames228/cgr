@@ -4,7 +4,8 @@ import time
 
 from telethon import TelegramClient, errors, functions, types
 
-from .worker import Incoming, Route, Undeliverable
+from .copy_post import send_copy
+from .worker import ForwardRestricted, Incoming, Route, Undeliverable
 
 LINK = re.compile(r'(?:https?://(?:t\.me|telegram\.me)/(?:s/)?)?@?([A-Za-z][A-Za-z0-9_]{3,31})/?')
 NUMERIC = re.compile(r'-100[0-9]+')
@@ -24,14 +25,14 @@ def channel_reference(value, public=False):
     raise ValueError(f'Некорректная ссылка или идентификатор канала: {value!r}')
 
 
-def client(session, api_id, api_hash):
+def client(session, api_id, api_hash, *, updates=False):
     return TelegramClient(str(session), api_id, api_hash, flood_sleep_threshold=0,
                           request_retries=1, raise_last_call_error=True,
-                          entity_cache_limit=500, receive_updates=False)
+                          entity_cache_limit=500, receive_updates=updates)
 
 
-def sent_id(updates, random_id, target):
-    if isinstance(updates, types.UpdateShortSentMessage):
+def sent_id(updates, random_id, target, *, single=True):
+    if single and isinstance(updates, types.UpdateShortSentMessage):
         return updates.id
     items = (updates.update,) if isinstance(updates, types.UpdateShort) else getattr(updates, 'updates', ())
     for update in items:
@@ -42,7 +43,7 @@ def sent_id(updates, random_id, target):
         if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage))
         and update.message.peer_id == types.PeerChannel(target.channel_id)
     ]
-    if len(messages) == 1:
+    if single and len(messages) == 1:
         return messages[0].id
     raise RetryLater('Telegram пока не вернул идентификатор отправленного сообщения')
 
@@ -131,16 +132,34 @@ class Telegram:
             after = item.id
             yield Incoming(item.id, item.date, getattr(item, 'message', None))
 
-    async def forward(self, route, post, random_id):
+    async def pace_posts(self):
         await asyncio.sleep(max(0, self.last_forwards + FORWARD_GAP - time.monotonic()))
         self.last_forwards = time.monotonic()
+
+    async def copy(self, route, post, random_id):
+        source, destination = route.source.channel_id, route.destination.channel_id
+        existing = self.archive.copied_id(source, destination, post)
+        if existing is not None:
+            return existing
+        await self.pace_posts()
+        updates, ids = await send_copy(self, route, post, random_id)
+        copies = {original: sent_id(updates, identifier, route.destination, single=len(ids) == 1)
+                  for original, identifier in ids.items()}
+        self.archive.store_copies(source, destination, copies)
+        return copies[post]
+
+    async def forward(self, route, post, random_id):
+        existing = self.archive.copied_id(route.source.channel_id, route.destination.channel_id, post)
+        if existing is not None:
+            return existing
+        await self.pace_posts()
         try:
             updates = await self.call('user', self.user, functions.messages.ForwardMessagesRequest(
                 from_peer=route.source, id=[post], random_id=[random_id], to_peer=route.destination,
                 silent=True,
             ))
         except errors.ChatForwardsRestrictedError as exc:
-            raise Undeliverable('Telegram запретил пересылку') from exc
+            raise ForwardRestricted from exc
         except (errors.MessageIdInvalidError, errors.MsgIdInvalidError) as exc:
             messages = await self.call('user', self.user.get_messages, route.source, ids=post)
             if messages is None:

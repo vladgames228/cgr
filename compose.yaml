@@ -2,14 +2,11 @@ services:
   bot:
     build:
       context: .
-      target: classic
     env_file: .env
     environment:
       DATA_DIR: /data
-      CHANNELS_FILE: /config/channels.json
     volumes:
       - data:/data
-      - ./channels.json:/config/channels.json:ro
     restart: unless-stopped
     init: true
     cpus: 2.0

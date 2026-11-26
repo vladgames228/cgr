@@ -9,11 +9,11 @@ import sqlite3
 import time
 from pathlib import Path
 
-from telethon import errors
+from telethon import errors, events
 
+from .control import Control, admin_ids
 from .storage import Archive, read_status
 from .telegram import RetryLater, Telegram, client
-from .worker import deliver, index_batch
 
 LOG = logging.getLogger(__name__)
 
@@ -22,28 +22,11 @@ class Config:
     def __init__(self):
         self.data = Path(os.environ.get('DATA_DIR', './data'))
         self.data.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.model = os.environ.get('MODEL_DIR')
+        self.model = os.environ.get('MODEL_DIR', '/model')
 
     def credentials(self):
         self.api_id = int(os.environ['TG_API_ID'])
         self.api_hash = os.environ['TG_API_HASH']
-
-    def routes(self):
-        raw = Path(os.environ.get('CHANNELS_FILE', './channels.json')).read_text(encoding='utf-8')
-        routes = json.loads(raw)
-        if not isinstance(routes, list) or not routes:
-            raise ValueError('channels.json должен содержать непустой массив маршрутов')
-        for route in routes:
-            if not isinstance(route, dict) or set(route) != {'source', 'destination'}:
-                raise ValueError('Каждый маршрут должен содержать поля source и destination')
-        return routes
-
-    def archive(self):
-        encoder = None
-        if self.model:
-            from .encoder import Encoder
-            encoder = Encoder(self.model)
-        return Archive(self.data / 'archive.sqlite3', encoder.identity if encoder else 'classic-v1', encoder)
 
 
 async def login(config):
@@ -58,35 +41,41 @@ async def login(config):
         await user.disconnect()
 
 
-async def schedule(routes, operation, idle, name):
-    ready = [0.0] * len(routes)
-    failures = [0] * len(routes)
+async def schedule(control, operation, idle, name):
+    ready = {}
+    failures = {}
+    generation = -1
     while True:
-        for index, route in enumerate(routes):
-            if ready[index] > time.monotonic():
+        if generation != control.generation:
+            generation = control.generation
+            ready.clear()
+            failures.clear()
+        for source in tuple(control.routes):
+            if ready.get(source, 0) > time.monotonic():
                 continue
             try:
-                work_remains = await operation(route)
-            except (RetryLater, errors.RPCError, OSError, asyncio.TimeoutError) as exc:
-                failures[index] += 1
-                delay = min(120, 2 ** min(failures[index], 7))
-                ready[index] = time.monotonic() + delay
-                LOG.warning('%s, источник %s: %s. Повтор через %s с',
-                            name, route.source.channel_id, exc, delay)
+                work_remains = await operation(source)
+            except (RetryLater, errors.RPCError, OSError, ValueError, asyncio.TimeoutError) as exc:
+                failures[source] = failures.get(source, 0) + 1
+                delay = min(120, 2 ** min(failures[source], 7))
+                ready[source] = time.monotonic() + delay
+                LOG.warning('%s, источник %s: %s. Повтор через %s с', name, source, exc, delay)
             else:
-                failures[index] = 0
-                ready[index] = time.monotonic() + (0 if work_remains else idle)
-        await asyncio.sleep(max(0, min(ready) - time.monotonic()))
+                failures.pop(source, None)
+                ready[source] = time.monotonic() + (0 if work_remains else idle)
+        now = time.monotonic()
+        next_run = min(ready.values(), default=now + 1)
+        await asyncio.sleep(max(0, min(1, next_run - now)))
 
 
 async def serve(config, check=False):
     token = os.environ['TG_BOT_TOKEN']
     bot_id = int(token.split(':', 1)[0])
     poll = max(5, int(os.environ.get('POLL_SECONDS', '30')))
-    settings = config.routes()
-    archive = config.archive()
+    admins = admin_ids(os.environ.get('TG_ADMIN_IDS', ''))
+    archive = Archive(config.data / 'archive.sqlite3')
     user = client(config.data / 'reader', config.api_id, config.api_hash)
-    bot = client(config.data / f'bot-{bot_id}', config.api_id, config.api_hash)
+    bot = client(config.data / f'bot-{bot_id}', config.api_id, config.api_hash, updates=not check)
     try:
         telegram = Telegram(user, bot, archive)
         while wait := max(telegram.pause_remaining('user'), telegram.pause_remaining('bot')):
@@ -99,25 +88,24 @@ async def serve(config, check=False):
         await telegram.call('bot', bot.start, bot_token=token)
         if (await telegram.call('bot', bot.get_me)).id != bot_id:
             raise ValueError('ID сессии бота не совпадает с токеном')
-        routes = []
-        for setting in settings:
-            routes.append(await telegram.configure(setting['source'], setting['destination']))
-        sources = {route.source.channel_id for route in routes}
-        if len(sources) != len(routes) or sources & {route.destination.channel_id for route in routes}:
-            raise ValueError('Источник можно указать один раз. Назначение должно быть отдельным каналом')
         archive.pin('reader_id', reader.id)
         archive.pin('bot_id', bot_id)
-        for route in routes:
-            archive.register(route.source.channel_id, route.destination.channel_id, route.discussion.channel_id)
-            LOG.info('Маршрут %s → %s, обсуждения %s', route.source.channel_id,
-                     route.destination.channel_id, route.discussion.channel_id)
+        control = Control(archive, telegram, config.model, admins)
         if check:
+            await control.warm_model()
             return
+        bot.add_event_handler(control.handle, events.NewMessage(incoming=True, func=lambda e: e.is_private))
+
+        async def warm():
+            try:
+                await control.warm_model()
+            except (ValueError, OSError, RuntimeError):
+                LOG.exception('Не удалось загрузить MiniLM. Проверьте образ или переключитесь на /mode classic.')
+
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(schedule(routes, lambda route: index_batch(archive, telegram, route.source),
-                                       poll, 'Чтение'))
-            tasks.create_task(schedule(routes, lambda route: deliver(archive, telegram, route),
-                                       2, 'Публикация'))
+            tasks.create_task(warm())
+            tasks.create_task(schedule(control, control.index, poll, 'Чтение'))
+            tasks.create_task(schedule(control, control.deliver, 2, 'Публикация'))
     finally:
         await asyncio.gather(user.disconnect(), bot.disconnect())
         archive.close()

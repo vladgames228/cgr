@@ -132,13 +132,17 @@ def unit(text, words):
     }
 
 
-def extract(text, encoder=None):
+def segments_for(text):
     normalized = unicodedata.normalize('NFKC', text)
     sentences = [sentence for sentence in SENTENCE.split(normalized) if sentence.strip()]
     words = tokens(normalized)
-    fragments = list(dict.fromkeys(parts(sentences)))
-    fragments = [fragment for fragment in fragments if tokens(fragment) != words]
-    segments = [normalized, *fragments]
+    fragments = dict.fromkeys(parts(sentences))
+    segments = [normalized, *(fragment for fragment in fragments if tokens(fragment) != words)]
+    return normalized, sentences, words, segments
+
+
+def extract(text, encoder=None):
+    normalized, sentences, words, segments = segments_for(text)
     units = []
     for index, segment in enumerate(segments):
         segment_words = tokens(segment)
