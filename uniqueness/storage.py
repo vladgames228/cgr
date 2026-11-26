@@ -1,10 +1,12 @@
 import json
+import math
+import os
 import secrets
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .analysis import compare, deserialize, extract, index_groups, prepare_for_scoring, serialize
+from .analysis import content, corpus_counts, deserialize, extract, novelty, phrases, semantic, serialize, words
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -73,6 +75,7 @@ class Archive:
             raise ValueError('Старая схема базы. Останови контейнер и очисти archive.sqlite3 перед запуском cgr.')
         self.db.executescript(SCHEMA)
         self.encoder = encoder
+        self._corpus_cache = {}
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('analyzer', analyzer_id))
         self.db.commit()
 
@@ -122,6 +125,14 @@ class Archive:
     def set_route_active(self, source, active):
         with self.db as db:
             db.execute('UPDATE channels SET active = ? WHERE source = ?', (int(active), source))
+
+    def rebuild_index(self, source):
+        with self.db as db:
+            db.execute('DELETE FROM postings WHERE source = ?', (source,))
+            db.execute('DELETE FROM posts WHERE source = ?', (source,))
+            db.execute('UPDATE channels SET cursor = 0, snapshot = NULL, history_done = 0, '
+                       'scan_count = 0, active = 1 WHERE source = ?', (source,))
+        self._corpus_cache.pop(source, None)
 
     def set_auto_publish(self, source, enabled):
         with self.db as db:
@@ -176,47 +187,82 @@ class Archive:
     def _store_post(self, source, post, original):
         if self.db.execute('SELECT 1 FROM posts WHERE source = ? AND id = ?', (source, post)).fetchone():
             return False
-        features = extract(original, self.encoder)
-        packed = serialize(features)
-        keys = {(metric, key) for metric, group in index_groups(features) for key in group}
-        probes = list(index_groups(features, query=True))
-        scores = self.score(source, post if post > 0 else 2**63 - 1,
-                            prepare_for_scoring(features), probes)
+        packed = serialize(extract(original, self.encoder))
         self.db.execute('INSERT INTO posts VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                        (source, post, original, packed, *scores))
-        self.db.executemany('INSERT OR IGNORE INTO postings VALUES (?, ?, ?, ?)',
-                            ((source, metric, key, post) for metric, key in keys))
+                        (source, post, original, packed, 0, 0, 0, 0))
+        self._corpus_cache.pop(source, None)
         return True
 
-    def score(self, source, post, current, probes):
-        similarities = [0.0] * 4
-        for candidate in self.candidates(source, post, probes):
-            row = self.db.execute('SELECT original, features FROM posts WHERE source = ? AND id = ?',
-                                  (source, candidate)).fetchone()
-            previous = deserialize(row['features'])
-            if 'vectors' in current and 'vectors' not in previous and self.encoder:
-                previous = prepare_for_scoring(extract(row['original'], self.encoder))
-            compare(current, previous, similarities)
-            if min(similarities) >= 1:
-                break
-        return tuple(round(100 * (1 - min(1.0, value))) for value in similarities)
+    def fill_vectors(self, source, batch_size=4):
+        if self.encoder is None:
+            return False
+        missing = []
+        for row in self.db.execute('SELECT id, original, features FROM posts WHERE source = ?', (source,)):
+            if not deserialize(row['features']).get('vectors'):
+                missing.append(row)
+                if len(missing) == batch_size:
+                    break
+        if not missing:
+            return False
+        with self.db as db:
+            for row in missing:
+                db.execute('UPDATE posts SET features = ? WHERE source = ? AND id = ?',
+                           (serialize(extract(row['original'], self.encoder)), source, row['id']))
+        self._corpus_cache.pop(source, None)
+        return True
 
-    def candidates(self, source, post, probes):
-        votes = {}
-        for metric, keys in probes:
-            for key in keys:
-                rows = self.db.execute('SELECT post FROM postings WHERE source = ? AND metric = ? AND key = ? '
-                                       'AND post < ? ORDER BY post DESC LIMIT 25',
-                                       (source, metric, key, post))
-                for row in rows:
-                    votes[row['post']] = votes.get(row['post'], 0) + 1
-        selected = sorted(votes, key=lambda candidate: (votes[candidate], candidate), reverse=True)[:25]
-        recent = self.db.execute('SELECT id FROM posts WHERE source = ? AND id < ? ORDER BY id DESC LIMIT 8',
-                                 (source, post))
-        yield from dict.fromkeys([*selected, *(row['id'] for row in recent)])
+    def _corpus(self, source):
+        if source not in self._corpus_cache:
+            rows = list(self.db.execute('SELECT id, original, features FROM posts WHERE source = ?', (source,)))
+            self._corpus_cache[source] = (rows, *corpus_counts(rows))
+        return self._corpus_cache[source]
+
+    def analyze(self, source, text, exclude=None):
+        rows, term_counts, phrase_counts, per_post = self._corpus(source)
+        others = len(rows) - (exclude in per_post)
+        terms = content(text)
+        combinations = phrases(terms)
+        owned_terms, owned_phrases = per_post.get(exclude, (set(), set()))
+        if not others:
+            return {'overall': 100, 'words': 100, 'phrases': 100, 'theme': None,
+                    'closest': None, 'model_pending': False}
+        normalized = words(text)
+        for row in rows:
+            if row['id'] != exclude and words(row['original']) == normalized:
+                return {'overall': 0, 'words': 0, 'phrases': 0,
+                        'theme': 0 if self.encoder else None, 'closest': row['id'],
+                        'model_pending': False}
+        vocabulary = novelty(terms, term_counts, owned_terms, others, max(2, math.ceil(others * 0.02)))
+        expressions = novelty(combinations, phrase_counts, owned_phrases, others, 1)
+        theme, closest, pending = None, None, False
+        if self.encoder:
+            pending = any(not deserialize(row['features']).get('vectors') for row in rows if row['id'] != exclude)
+            if not pending:
+                theme, closest = semantic(extract(text, self.encoder)['vectors'], rows, exclude)
+        if closest is None and terms:
+            query = set(terms)
+            closest = max((row['id'] for row in rows if row['id'] != exclude),
+                          key=lambda post: len(query & per_post[post][0]), default=None)
+            if closest is not None and not (query & per_post[closest][0]):
+                closest = None
+        measures = [vocabulary, expressions]
+        if theme is not None:
+            measures.append(theme)
+        overall = min(measures)
+        return {'overall': overall, 'words': vocabulary, 'phrases': expressions,
+                'theme': theme, 'closest': closest, 'model_pending': pending}
 
     def indexed_count(self, source):
         return self.db.execute('SELECT count(*) FROM posts WHERE source = ?', (source,)).fetchone()[0]
+
+    def vector_count(self, source):
+        return sum(bool(deserialize(row['features']).get('vectors')) for row in
+                   self.db.execute('SELECT features FROM posts WHERE source = ?', (source,)))
+
+    def size_mb(self):
+        path = self.db.execute('PRAGMA database_list').fetchone()['file']
+        return sum(os.path.getsize(path + suffix) for suffix in ('', '-wal', '-shm')
+                   if os.path.exists(path + suffix)) / (1024 * 1024)
 
     def enqueue(self, source, post, result):
         with self.db as db:

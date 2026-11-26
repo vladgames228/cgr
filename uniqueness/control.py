@@ -1,12 +1,12 @@
 import asyncio
 import logging
+import os
 import re
 import secrets
 import time
 
 from telethon import Button, errors, types
 
-from .analysis import extract, index_groups, prepare_for_scoring, report
 from .encoder import Encoder, ensure_model
 from .telegram import RetryLater, channel_reference
 from .worker import Route, deliver, index_batch
@@ -18,7 +18,7 @@ HELP = (
     'Бот собирает историю канала в базу. Публикация новых постов включается отдельно.\n\n'
     '/channel @источник @мой_канал — выбрать каналы\n'
     '/post on|off — копировать новые посты и отвечать оценкой в моём канале\n'
-    '/index on|off — собирать базу в фоне\n'
+    '/index on|off|rebuild — сбор базы или пересборка с начала\n'
     '/llm on|off — включить или выключить MiniLM\n'
     '/an — проверить ссылку, пересланный пост или текст в личке\n'
     '/status — режимы, прогресс, очередь и ошибки\n'
@@ -42,6 +42,10 @@ class Control:
         self.waiting = set()
         self.index_offers = {}
         self.last_offer = {}
+        self.posting_offers = set()
+        self.posted_offers = set()
+        self.post_progress = {}
+        self.model_ram_mb = None
         self.command_lock = asyncio.Lock()
         self.delivery_locks = {}
         self.generation = 0
@@ -63,12 +67,15 @@ class Control:
             previous_mode = self.mode
             self.mode = 'minilm'
             self.model_state = 'загрузка'
+            before_ram = self.ram_mb()
             try:
                 await asyncio.to_thread(ensure_model, self.model_dir)
                 encoder = await asyncio.to_thread(Encoder, self.model_dir)
                 self.archive.set_encoder(encoder)
                 self.encoder = encoder
                 self.model_state = 'готова'
+                after_ram = self.ram_mb()
+                self.model_ram_mb = max(0, after_ram - before_ram) if before_ram is not None and after_ram is not None else None
                 self.model_error = None
             except Exception as exc:
                 self.mode = previous_mode
@@ -79,8 +86,10 @@ class Control:
             self.encoder = None
             self.archive.set_encoder(None)
             self.model_state = 'выключена'
+            self.model_ram_mb = None
         self.mode = 'minilm' if enabled else 'classic'
         self.archive.set_setting('mode', self.mode)
+        self.generation += 1
 
     async def channel(self, source_ref, destination_ref):
         route = await self.telegram.configure(source_ref, destination_ref)
@@ -114,22 +123,54 @@ class Control:
             raise ValueError('Нужна ссылка на канал')
         return peer.channel_id
 
-    def score_text(self, source, text, before=2**63 - 1):
+    def score_text(self, source, text, exclude=None):
         if not text or not text.strip():
             return 'У поста нет текста для оценки.'
-        features = extract(text, self.encoder)
-        probes = list(index_groups(features, query=True))
-        scores = self.archive.score(source, before, prepare_for_scoring(features), probes)
-        return report(scores)
+        scores = self.archive.analyze(source, text, exclude)
+        lines = [f'Новизна: {scores["overall"]}%',
+                 f'Словарь: {scores["words"]}%',
+                 f'Выражения: {scores["phrases"]}%']
+        if scores['theme'] is not None:
+            lines.append(f'Темы: {scores["theme"]}%')
+        elif scores['model_pending']:
+            lines.append('Темы: MiniLM ещё строит индекс')
+        elif self.encoder:
+            lines.append('Темы: в базе пока нет других постов')
+        else:
+            lines.append('Темы: MiniLM выкл')
+        if post := scores['closest']:
+            name = self.archive.setting(f'route_name:{source}', '').split(' → ', 1)[0]
+            if post < 0:
+                link = 'ручной образец'
+            elif name.startswith('@'):
+                link = f'https://t.me/{name[1:]}/{post}'
+            else:
+                link = f'https://t.me/c/{source}/{post}'
+            lines.append(f'Похожий пост: {link}')
+        return '\n'.join(lines)
 
-    def offer_index(self, sender, source, post, text):
+    @staticmethod
+    def ram_mb():
+        try:
+            with open('/proc/self/status', encoding='ascii') as status:
+                for line in status:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1]) / 1024
+        except OSError:
+            pass
+        return None
+
+    def offer_index(self, sender, source, post, text, result):
         if sender is None or not text or not text.strip():
             return
         token = secrets.token_urlsafe(12)
-        self.index_offers[token] = (sender, source, post, text)
+        self.index_offers[token] = (sender, source, post, text, result)
         self.last_offer[sender] = token
         if len(self.index_offers) > 100:
-            self.index_offers.pop(next(iter(self.index_offers)))
+            expired = next(iter(self.index_offers))
+            self.index_offers.pop(expired)
+            self.post_progress.pop(expired, None)
+            self.posted_offers.discard(expired)
 
     async def analyze(self, value=None, forward=None, sender=None):
         if not self.routes:
@@ -143,9 +184,9 @@ class Control:
                                             self.routes[source].source, ids=post)
             if text is None:
                 raise ValueError('Пост не найден')
-            self.offer_index(sender, source, post, text.message)
-            return f'Пост {post}, база {self.archive.indexed_count(source)}:\n' + self.score_text(
-                source, text.message, post)
+            result = self.score_text(source, text.message, post)
+            self.offer_index(sender, source, post, text.message, result)
+            return f'Пост {post}, база {self.archive.indexed_count(source)}:\n' + result
         value = (value or '').strip()
         public = POST_LINK.fullmatch(value)
         private = PRIVATE_LINK.fullmatch(value)
@@ -160,9 +201,9 @@ class Control:
                                             self.routes[source].source, ids=post)
             if item is None:
                 raise ValueError('Пост не найден')
-            self.offer_index(sender, source, post, item.message)
-            return f'Пост {post}, база {self.archive.indexed_count(source)}:\n' + self.score_text(
-                source, item.message, post)
+            result = self.score_text(source, item.message, post)
+            self.offer_index(sender, source, post, item.message, result)
+            return f'Пост {post}, база {self.archive.indexed_count(source)}:\n' + result
         if value.startswith(('t.me/', 'https://t.me/', 'http://t.me/')):
             raise ValueError('Пришли ссылку на отдельный пост, например https://t.me/channel/123')
         if not value:
@@ -175,9 +216,10 @@ class Control:
             source = next(iter(self.routes))
         if source not in self.routes:
             raise ValueError('Для текста укажи канал: /an @канал текст')
-        self.offer_index(sender, source, None, value)
+        result = self.score_text(source, value)
+        self.offer_index(sender, source, None, value, result)
         return (f'Сравнение с базой {self.archive.indexed_count(source)} постов:\n'
-                + self.score_text(source, value))
+                + result)
 
     async def index(self, source):
         if self.mode == 'minilm' and self.encoder is None:
@@ -185,6 +227,8 @@ class Control:
         if source not in self.routes or not self.archive.route_active(source):
             return False
         generation = self.generation
+        if self.encoder and self.archive.fill_vectors(source):
+            return True
         return await index_batch(self.archive, self.telegram, self.routes[source].source,
                                  should_continue=lambda: generation == self.generation
                                  and self.archive.route_active(source))
@@ -224,7 +268,12 @@ class Control:
     async def status(self):
         lines = [f'📤 Публикация: {"вкл" if any(self.archive.state(s)["auto_publish"] for s in self.routes) else "выкл"}',
                  f'📚 Индексация: {"вкл" if any(self.archive.route_active(s) for s in self.routes) else "выкл"}',
-                 f'🧠 MiniLM: {"вкл" if self.mode == "minilm" and self.encoder else "выкл"} ({self.model_state})']
+                 f'🧠 MiniLM: {"вкл" if self.mode == "minilm" and self.encoder else "выкл"}']
+        if self.model_ram_mb is not None and self.encoder:
+            lines.append(f'🧠 Память MiniLM: ~{self.model_ram_mb:.0f} МБ')
+        if ram := self.ram_mb():
+            lines.append(f'💾 Память процесса: {ram:.0f} МБ')
+        lines.append(f'🗃 База: {self.archive.size_mb():.1f} МБ')
         if self.model_error:
             lines.append(f'⚠️ Модель: {self.model_error[:250]}')
         for source, route in self.routes.items():
@@ -237,12 +286,16 @@ class Control:
             except (OSError, errors.RPCError, RetryLater):
                 cached = self.count_cache.get(source, (None, 0))[0]
             indexed = self.archive.indexed_count(source)
+            ready = self.archive.vector_count(source) if self.encoder else None
+            without_text = max(0, row['scan_count'] - indexed)
             new = max(0, cached - row['scan_count']) if cached is not None else '?'
             name = self.archive.setting(f'route_name:{source}', f'-100{source}')
             lines.append(f'\n{name}\n📨 в канале: {cached if cached is not None else "?"}; '
-                         f'просмотрено: {row["scan_count"]}; в базе: {indexed}; осталось просмотреть: ~{new}\n'
+                         f'просмотрено: {row["scan_count"]}; в базе: {indexed}; без текста/служебных: ~{without_text}; осталось просмотреть: ~{new}\n'
                          f'⏳ очередь: {self.archive.queue_size(source)} '
                          f'({"идёт" if self.archive.delivery_enabled(source) and row["auto_publish"] else "пауза"})')
+            if ready is not None:
+                lines.append(f'🧠 Векторы MiniLM: {ready}/{indexed}')
             if error := self.archive.error(source):
                 lines.append(f'⚠️ {error[:250]}')
         if not self.routes:
@@ -286,9 +339,17 @@ class Control:
                 if len(argument.split()) != 2:
                     return 'Пришли /channel @источник @мой_канал'
                 return await self.channel(*argument.split())
+            if command == '/index' and argument == 'rebuild':
+                if not self.routes:
+                    return 'Сначала настрой каналы: /channel @источник @мой_канал'
+                self.generation += 1
+                for source in self.routes:
+                    self.archive.rebuild_index(source)
+                return '📚 Индекс очищен. Индексация всей истории началась заново; публикация и очередь не изменены.'
             if command in ('/post', '/index', '/llm'):
                 if argument not in ('on', 'off'):
-                    return f'Используй {command} on или {command} off.'
+                    return ('Используй /index on, /index off или /index rebuild.' if command == '/index'
+                            else f'Используй {command} on или {command} off.')
                 enabled = argument == 'on'
                 if command == '/llm':
                     await self.set_llm(enabled)
@@ -330,7 +391,8 @@ class Control:
         if answer:
             try:
                 token = self.last_offer.pop(event.sender_id, None)
-                buttons = [[Button.inline('➕ Индексировать', f'idx:{token}'.encode())]] if token else None
+                buttons = [[Button.inline('➕ Индексировать', f'idx:{token}'.encode()),
+                            Button.inline('📤 Запостить', f'post:{token}'.encode())]] if token else None
                 await event.respond(answer[:4000], parse_mode=None, link_preview=False, buttons=buttons)
             except (OSError, errors.RPCError, RetryLater) as exc:
                 LOG.warning('Ответ администратору не доставлен: %s', exc)
@@ -338,14 +400,46 @@ class Control:
     async def handle_button(self, event):
         if not event.is_private or event.sender_id not in self.admins:
             return
-        token = (event.data or b'').removeprefix(b'idx:').decode('ascii', errors='ignore')
-        offer = self.index_offers.get(token) if (event.data or b'').startswith(b'idx:') else None
+        data = event.data or b''
+        action, _, raw_token = data.partition(b':')
+        token = raw_token.decode('ascii', errors='ignore')
+        offer = self.index_offers.get(token) if action in (b'idx', b'post') else None
         if not offer or offer[0] != event.sender_id:
             await event.answer('Анализ устарел. Повтори /an.', alert=True)
             return
         try:
-            added = self.archive.add_reference(*offer[1:])
-            await event.answer('Добавлено в базу.' if added else 'Уже в базе.', alert=True)
+            if action == b'idx':
+                added = self.archive.add_reference(*offer[1:4])
+                await event.answer('Добавлено в базу.' if added else 'Уже в базе.', alert=True)
+            else:
+                if token in self.posted_offers:
+                    await event.answer('Уже опубликовано.', alert=True)
+                    return
+                if token in self.posting_offers:
+                    await event.answer('Публикация уже идёт.', alert=True)
+                    return
+                self.posting_offers.add(token)
+                try:
+                    _, source, post, text, result = offer
+                    route = self.routes[source]
+                    random_post, random_report, published = self.post_progress.setdefault(
+                        token, [secrets.randbits(63) or 1, secrets.randbits(63) or 1, None])
+                    if published is None:
+                        if post is None:
+                            published = await self.telegram.send_text(route, text, random_post)
+                        else:
+                            from .worker import ForwardRestricted
+                            try:
+                                published = await self.telegram.forward(route, post, random_post)
+                            except ForwardRestricted:
+                                published = await self.telegram.copy(route, post, random_post)
+                        self.post_progress[token][2] = published
+                    await self.telegram.send_report(route, published, result, random_report)
+                    self.posted_offers.add(token)
+                    self.post_progress.pop(token, None)
+                finally:
+                    self.posting_offers.discard(token)
+                await event.answer('Опубликовано в канале.', alert=True)
         except Exception as exc:
             LOG.exception('Не удалось индексировать пост вручную')
             await event.answer(f'Ошибка: {type(exc).__name__}: {exc}'[:200], alert=True)

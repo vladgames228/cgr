@@ -166,3 +166,9 @@ class Telegram:
         except (errors.MsgIdInvalidError, errors.MessageIdInvalidError) as exc:
             raise Undeliverable('пересланный пост недоступен для ответа') from exc
         return sent_id(updates, random_id, route.destination)
+
+    async def send_text(self, route, text, random_id):
+        await self.pace_posts()
+        updates = await self.call('user', self.user, functions.messages.SendMessageRequest(
+            peer=route.destination, message=text, random_id=random_id, silent=True, no_webpage=True))
+        return sent_id(updates, random_id, route.destination)

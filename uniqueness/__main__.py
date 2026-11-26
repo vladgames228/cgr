@@ -102,7 +102,7 @@ async def serve(config, check=False):
                 scope=types.BotCommandScopeDefault(), lang_code='', commands=[
                     types.BotCommand('channel', 'Источник и мой канал'),
                     types.BotCommand('post', 'Публикация on/off'),
-                    types.BotCommand('index', 'Индексация on/off'),
+                    types.BotCommand('index', 'Индексация on/off/rebuild'),
                     types.BotCommand('llm', 'MiniLM on/off'),
                     types.BotCommand('an', 'Проверить пост или текст'),
                     types.BotCommand('status', 'Режимы, прогресс и ошибки'),

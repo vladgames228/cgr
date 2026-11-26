@@ -56,7 +56,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await index_batch(self.archive, telegram, self.route.source))
         self.assertEqual(self.archive.indexed_count(1), 2)
         self.assertEqual(self.archive.queue_size(1), 0)
-        self.assertEqual(self.archive.db.execute('SELECT wording FROM posts WHERE id=2').fetchone()[0], 0)
+        self.assertEqual(self.archive.analyze(1, 'Первый текст')['overall'], 0)
 
     async def test_independent_modes_and_stop(self):
         telegram = SimpleNamespace(head=AsyncMock(return_value=10))
@@ -86,8 +86,8 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
             semantic = await control.analyze('Текст для повторной оценки.')
             self.assertIn('выключена', await control.dispatch('/llm off'))
             classic = await control.analyze('Текст для повторной оценки.')
-            self.assertIn('Уникальность', semantic)
-            self.assertIn('Уникальность', classic)
+            self.assertIn('Новизна:', semantic)
+            self.assertIn('Новизна:', classic)
         self.archive.set_setting('mode', 'minilm')
         self.archive.set_auto_publish(1, 1)
         restarted = self.control(SimpleNamespace(count=AsyncMock(return_value=0)))
@@ -135,7 +135,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         control = self.control(SimpleNamespace(user=user, call=call))
         first = await control.analyze('https://t.me/source_channel/2')
         self.assertEqual(first, await control.analyze('https://t.me/source_channel/2'))
-        self.assertIn('Уникальность', await control.analyze('Другой текст для сравнения.'))
+        self.assertIn('Новизна:', await control.analyze('Другой текст для сравнения.'))
         self.assertEqual(self.archive.queue_size(1), 0)
 
         await control.dispatch('/an', sender=100)
@@ -174,7 +174,95 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.state(1)['cursor'], 0)
         self.assertEqual(self.archive.state(1)['scan_count'], 0)
         self.assertEqual(self.archive.queue_size(1), 0)
-        self.assertIn('Уникальность', await control.analyze('Текст вручную.'))
+        self.assertIn('Новизна:', await control.analyze('Текст вручную.'))
+
+    async def test_link_checks_whole_channel_except_itself(self):
+        self.archive.index(1, 1, '2025', 'Повторяемый тезис про мужчин.')
+        self.archive.index(1, 2, '2025', 'Совсем другая публикация.')
+        self.archive.index(1, 3, '2025', 'Повторяемый тезис про мужчин.')
+        self.archive.set_setting('route_name:1', '@source_channel → @my_channel')
+        user = SimpleNamespace(get_messages=AsyncMock(return_value=SimpleNamespace(
+            message='Повторяемый тезис про мужчин.')),
+            get_input_entity=AsyncMock(return_value=peer(1)))
+
+        async def call(identity, operation, *args, **kwargs):
+            return await operation(*args, **kwargs)
+
+        control = self.control(SimpleNamespace(user=user, call=call))
+        answer = await control.analyze('https://t.me/source_channel/1')
+        self.assertIn('Новизна: 0%', answer)
+        self.assertIn('https://t.me/source_channel/3', answer)
+        self.assertIn('Новизна: 0%', await control.analyze('Повторяемый тезис про мужчин.'))
+
+    async def test_channel_frequency_and_semantic_coverage(self):
+        for post in range(1, 12):
+            self.archive.index(1, post, '2025', f'Мужчины снова повторяют знакомый тезис номер {post}.')
+        repeated = self.archive.analyze(1, 'Мужчины снова повторяют знакомый тезис.')
+        technical = self.archive.analyze(1, 'Документация компилятора описывает асинхронный протокол.')
+        self.assertLess(repeated['words'], technical['words'])
+        self.assertLess(repeated['phrases'], technical['phrases'])
+        self.assertLess(repeated['overall'], technical['overall'])
+
+        class FakeEncoder:
+            identity = 'semantic-test'
+
+            def encode(self, texts):
+                return [[1, 0] if 'мужчин' in text else [0, 1] for text in texts]
+
+        self.archive.set_encoder(FakeEncoder())
+        self.archive.rebuild_index(1)
+        self.archive.index(1, 1, '2025', 'Мужчины повторяют одну мысль.')
+        self.archive.index(1, 2, '2025', 'Текст документации другой области.')
+        self.assertEqual(self.archive.analyze(1, 'Мужчины снова говорят похожее.')['theme'], 0)
+        self.assertEqual(self.archive.analyze(1, 'Совершенно иной материал.', exclude=2)['theme'], 100)
+
+    async def test_llm_backfills_posts_indexed_while_off(self):
+        self.archive.index(1, 1, '2025', 'Мужчины повторяют старую мысль.')
+
+        class FakeEncoder:
+            identity = 'backfill-test'
+
+            def encode(self, texts):
+                return [[1, 0] for _ in texts]
+
+        self.archive.set_encoder(FakeEncoder())
+        self.assertTrue(self.archive.analyze(1, 'Новая формулировка')['model_pending'])
+        self.assertTrue(self.archive.fill_vectors(1))
+        self.assertEqual(self.archive.vector_count(1), 1)
+        self.assertFalse(self.archive.analyze(1, 'Новая формулировка')['model_pending'])
+        self.assertEqual(self.archive.state(1)['cursor'], 1)
+        self.assertEqual(self.archive.queue_size(1), 0)
+
+    async def test_rebuild_index_resets_progress_without_touching_publication(self):
+        self.archive.index(1, 1, '2025', 'Исходный текст.')
+        self.archive.enqueue(1, 5, 'Оценка')
+        self.archive.set_auto_publish(1, 1)
+        control = self.control(SimpleNamespace())
+        self.assertIn('началась заново', await control.dispatch('/index rebuild'))
+        self.assertEqual(self.archive.indexed_count(1), 0)
+        self.assertEqual(self.archive.state(1)['cursor'], 0)
+        self.assertEqual(self.archive.state(1)['scan_count'], 0)
+        self.assertTrue(self.archive.route_active(1))
+        self.assertEqual(self.archive.state(1)['auto_publish'], 1)
+        self.assertEqual(self.archive.queue_size(1), 1)
+
+    async def test_manual_post_button_publishes_text_and_report(self):
+        telegram = SimpleNamespace(send_text=AsyncMock(return_value=50),
+                                   send_report=AsyncMock(return_value=51))
+        control = self.control(telegram)
+        event = SimpleNamespace(sender_id=100, is_private=True, raw_text='/an Проверяемый текст.',
+                                message=SimpleNamespace(fwd_from=None), respond=AsyncMock())
+        await control.handle(event)
+        button = event.respond.await_args.kwargs['buttons'][0][1]
+        callback = SimpleNamespace(sender_id=100, is_private=True, data=button.data,
+                                   answer=AsyncMock())
+        await control.handle_button(callback)
+        telegram.send_text.assert_awaited_once()
+        telegram.send_report.assert_awaited_once()
+        self.assertEqual(telegram.send_report.await_args.args[1], 50)
+        self.assertEqual(self.archive.queue_size(1), 0)
+        await control.handle_button(callback)
+        self.assertIn('Уже опубликовано', callback.answer.await_args.args[0])
 
     async def test_queue_pause_and_clear(self):
         self.archive.enqueue(1, 5, 'Оценка')
