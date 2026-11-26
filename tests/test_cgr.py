@@ -233,6 +233,37 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.state(1)['cursor'], 1)
         self.assertEqual(self.archive.queue_size(1), 0)
 
+    async def test_posts_with_only_emoji_do_not_block_vector_backfill(self):
+        self.archive.index(1, 1, '2025', '🧠🔥')
+        self.archive.index(1, 2, '2025', 'Текст с эмодзи 🧠')
+        self.assertEqual(self.archive.indexed_count(1), 1)
+        self.assertEqual(self.archive.state(1)['scan_count'], 2)
+        with self.assertRaisesRegex(ValueError, 'нет слов'):
+            self.archive.add_reference(1, None, '🧠🔥')
+
+        class FakeEncoder:
+            identity = 'emoji-test'
+
+            def encode(self, texts):
+                return [[1, 0] for _ in texts]
+
+        self.archive.set_encoder(FakeEncoder())
+        self.assertTrue(self.archive.fill_vectors(1))
+        self.assertFalse(self.archive.fill_vectors(1))
+        self.assertEqual(self.archive.vector_count(1), 1)
+        self.assertFalse(self.archive.analyze(1, 'Другой текст')['model_pending'])
+
+    async def test_old_wordless_posts_are_removed_on_open(self):
+        path = Path(self.temp.name) / 'old-wordless.sqlite3'
+        old = Archive(path)
+        with old.db:
+            old.db.execute('INSERT INTO posts VALUES (?, ?, ?, ?, 0, 0, 0, 0)',
+                           (1, 1, '🧠🔥', b'x'))
+        old.close()
+        reopened = Archive(path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.indexed_count(1), 0)
+
     async def test_rebuild_index_resets_progress_without_touching_publication(self):
         self.archive.index(1, 1, '2025', 'Исходный текст.')
         self.archive.enqueue(1, 5, 'Оценка')

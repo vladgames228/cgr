@@ -77,6 +77,10 @@ class Archive:
         self.encoder = encoder
         self._corpus_cache = {}
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('analyzer', analyzer_id))
+        empty_posts = [(row['source'], row['id']) for row in
+                       self.db.execute('SELECT source, id, original FROM posts')
+                       if not words(row['original'])]
+        self.db.executemany('DELETE FROM posts WHERE source = ? AND id = ?', empty_posts)
         self.db.commit()
 
     def close(self):
@@ -167,7 +171,7 @@ class Archive:
         if self.state(source)['cursor'] >= post:
             return
         with self.db as db:
-            if original and original.strip():
+            if original and words(original):
                 self._store_post(source, post, original)
             db.execute('UPDATE channels SET cursor = ?, scan_count = scan_count + 1 WHERE source = ?',
                        (post, source))
@@ -175,8 +179,8 @@ class Archive:
     def add_reference(self, source, post, original):
         if self.state(source) is None:
             raise ValueError('Канал не настроен')
-        if not original or not original.strip():
-            raise ValueError('У поста нет текста для индексации')
+        if not original or not words(original):
+            raise ValueError('У поста нет слов для индексации')
         with self.db:
             if post is None:
                 row = self.db.execute('SELECT MIN(id) FROM posts WHERE source = ? AND id < 0',
@@ -185,6 +189,8 @@ class Archive:
             return self._store_post(source, post, original)
 
     def _store_post(self, source, post, original):
+        if not words(original):
+            return False
         if self.db.execute('SELECT 1 FROM posts WHERE source = ? AND id = ?', (source, post)).fetchone():
             return False
         packed = serialize(extract(original, self.encoder))
@@ -198,7 +204,7 @@ class Archive:
             return False
         missing = []
         for row in self.db.execute('SELECT id, original, features FROM posts WHERE source = ?', (source,)):
-            if not deserialize(row['features']).get('vectors'):
+            if words(row['original']) and not deserialize(row['features']).get('vectors'):
                 missing.append(row)
                 if len(missing) == batch_size:
                     break
@@ -236,7 +242,8 @@ class Archive:
         expressions = novelty(combinations, phrase_counts, owned_phrases, others, 1)
         theme, closest, pending = None, None, False
         if self.encoder:
-            pending = any(not deserialize(row['features']).get('vectors') for row in rows if row['id'] != exclude)
+            pending = any(words(row['original']) and not deserialize(row['features']).get('vectors')
+                          for row in rows if row['id'] != exclude)
             if not pending:
                 theme, closest = semantic(extract(text, self.encoder)['vectors'], rows, exclude)
         if closest is None and terms:

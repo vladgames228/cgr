@@ -7,6 +7,7 @@ import time
 
 from telethon import Button, errors, types
 
+from .analysis import words
 from .encoder import Encoder, ensure_model
 from .telegram import RetryLater, channel_reference
 from .worker import Route, deliver, index_batch
@@ -124,8 +125,8 @@ class Control:
         return peer.channel_id
 
     def score_text(self, source, text, exclude=None):
-        if not text or not text.strip():
-            return 'У поста нет текста для оценки.'
+        if not text or not words(text):
+            return 'У поста нет слов для оценки.'
         scores = self.archive.analyze(source, text, exclude)
         lines = [f'Новизна: {scores["overall"]}%',
                  f'Словарь: {scores["words"]}%',
@@ -161,7 +162,7 @@ class Control:
         return None
 
     def offer_index(self, sender, source, post, text, result):
-        if sender is None or not text or not text.strip():
+        if sender is None or not text or not words(text):
             return
         token = secrets.token_urlsafe(12)
         self.index_offers[token] = (sender, source, post, text, result)
