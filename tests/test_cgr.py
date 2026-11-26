@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from telethon import functions, types
 
+from uniqueness.analysis import semantic, serialize
 from uniqueness.control import Control
 from uniqueness.storage import Archive
 from uniqueness.telegram import Telegram
@@ -32,6 +33,13 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
 
     def control(self, telegram):
         return Control(self.archive, telegram, self.temp.name, {100})
+
+    async def test_semantic_score_changes_gradually_with_similarity(self):
+        rows = [{'id': 1, 'features': serialize({'vectors': [[1, 0]]})}]
+        self.assertEqual(semantic([[1, 0]], rows), 0)
+        self.assertGreater(semantic([[1, 1]], rows), 0)
+        self.assertLess(semantic([[1, 1]], rows), 100)
+        self.assertEqual(semantic([[0, 1]], rows), 100)
 
     async def test_new_channel_starts_passive_indexing(self):
         fresh = Archive(Path(self.temp.name) / 'fresh.sqlite3')
@@ -86,8 +94,8 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
             semantic = await control.analyze('Текст для повторной оценки.')
             self.assertIn('выключена', await control.dispatch('/llm off'))
             classic = await control.analyze('Текст для повторной оценки.')
-            self.assertIn('Новизна:', semantic)
-            self.assertIn('Новизна:', classic)
+            self.assertIn('Уникальность в канале:', semantic)
+            self.assertIn('Уникальность в канале:', classic)
         self.archive.set_setting('mode', 'minilm')
         self.archive.set_auto_publish(1, 1)
         restarted = self.control(SimpleNamespace(count=AsyncMock(return_value=0)))
@@ -113,6 +121,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await deliver(self.archive, transport, self.route))
         transport.send_report.assert_awaited_once()
         self.assertEqual(transport.send_report.await_args.args[1], 41)
+        self.assertEqual(transport.send_report.await_args.args[2], 'Уникальность в канале: 100%')
         self.assertEqual(self.archive.queue_size(1), 0)
 
         user = AsyncMock(return_value=SimpleNamespace(updates=[types.UpdateMessageID(id=42, random_id=99)]))
@@ -135,7 +144,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         control = self.control(SimpleNamespace(user=user, call=call))
         first = await control.analyze('https://t.me/source_channel/2')
         self.assertEqual(first, await control.analyze('https://t.me/source_channel/2'))
-        self.assertIn('Новизна:', await control.analyze('Другой текст для сравнения.'))
+        self.assertIn('Уникальность в канале:', await control.analyze('Другой текст для сравнения.'))
         self.assertEqual(self.archive.queue_size(1), 0)
 
         await control.dispatch('/an', sender=100)
@@ -145,7 +154,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
                                 respond=AsyncMock())
         await control.handle(event)
         event.respond.assert_awaited_once()
-        self.assertIn('Пост 2', event.respond.await_args.args[0])
+        self.assertIn('Уникальность в канале:', event.respond.await_args.args[0])
         button = event.respond.await_args.kwargs['buttons'][0][0]
         callback = SimpleNamespace(sender_id=100, is_private=True, data=button.data,
                                    answer=AsyncMock())
@@ -174,7 +183,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.state(1)['cursor'], 0)
         self.assertEqual(self.archive.state(1)['scan_count'], 0)
         self.assertEqual(self.archive.queue_size(1), 0)
-        self.assertIn('Новизна:', await control.analyze('Текст вручную.'))
+        self.assertIn('Уникальность в канале:', await control.analyze('Текст вручную.'))
 
     async def test_link_checks_whole_channel_except_itself(self):
         self.archive.index(1, 1, '2025', 'Повторяемый тезис про мужчин.')
@@ -190,9 +199,9 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
 
         control = self.control(SimpleNamespace(user=user, call=call))
         answer = await control.analyze('https://t.me/source_channel/1')
-        self.assertIn('Новизна: 0%', answer)
-        self.assertIn('https://t.me/source_channel/3', answer)
-        self.assertIn('Новизна: 0%', await control.analyze('Повторяемый тезис про мужчин.'))
+        self.assertEqual(answer, 'Уникальность в канале: 0%')
+        self.assertEqual(await control.analyze('Повторяемый тезис про мужчин.'), answer)
+        self.assertLessEqual(self.archive.analyze(1, 'Совсем другая публикация.', exclude=2)['words'], 100)
 
     async def test_channel_frequency_and_semantic_coverage(self):
         for post in range(1, 12):
@@ -202,6 +211,15 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(repeated['words'], technical['words'])
         self.assertLess(repeated['phrases'], technical['phrases'])
         self.assertLess(repeated['overall'], technical['overall'])
+
+        for post in range(12, 112):
+            self.archive.index(1, post, '2025',
+                               f'Мужчины обижены ругаются повторяют тезис {post}.')
+        familiar = self.archive.analyze(
+            1, 'Мужчины обижены ругаются повторяют новый научный протокол исследования.')
+        self.assertLessEqual(familiar['overall'], 30)
+        self.assertEqual(self.archive.analyze(
+            1, 'Документация компилятора описывает асинхронный протокол.')['overall'], 100)
 
         class FakeEncoder:
             identity = 'semantic-test'

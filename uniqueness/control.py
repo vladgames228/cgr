@@ -128,27 +128,7 @@ class Control:
         if not text or not words(text):
             return 'У поста нет слов для оценки.'
         scores = self.archive.analyze(source, text, exclude)
-        lines = [f'Новизна: {scores["overall"]}%',
-                 f'Словарь: {scores["words"]}%',
-                 f'Выражения: {scores["phrases"]}%']
-        if scores['theme'] is not None:
-            lines.append(f'Темы: {scores["theme"]}%')
-        elif scores['model_pending']:
-            lines.append('Темы: MiniLM ещё строит индекс')
-        elif self.encoder:
-            lines.append('Темы: в базе пока нет других постов')
-        else:
-            lines.append('Темы: MiniLM выкл')
-        if post := scores['closest']:
-            name = self.archive.setting(f'route_name:{source}', '').split(' → ', 1)[0]
-            if post < 0:
-                link = 'ручной образец'
-            elif name.startswith('@'):
-                link = f'https://t.me/{name[1:]}/{post}'
-            else:
-                link = f'https://t.me/c/{source}/{post}'
-            lines.append(f'Похожий пост: {link}')
-        return '\n'.join(lines)
+        return f'Уникальность в канале: {scores["overall"]}%'
 
     @staticmethod
     def ram_mb():
@@ -187,7 +167,7 @@ class Control:
                 raise ValueError('Пост не найден')
             result = self.score_text(source, text.message, post)
             self.offer_index(sender, source, post, text.message, result)
-            return f'Пост {post}, база {self.archive.indexed_count(source)}:\n' + result
+            return result
         value = (value or '').strip()
         public = POST_LINK.fullmatch(value)
         private = PRIVATE_LINK.fullmatch(value)
@@ -204,7 +184,7 @@ class Control:
                 raise ValueError('Пост не найден')
             result = self.score_text(source, item.message, post)
             self.offer_index(sender, source, post, item.message, result)
-            return f'Пост {post}, база {self.archive.indexed_count(source)}:\n' + result
+            return result
         if value.startswith(('t.me/', 'https://t.me/', 'http://t.me/')):
             raise ValueError('Пришли ссылку на отдельный пост, например https://t.me/channel/123')
         if not value:
@@ -219,8 +199,7 @@ class Control:
             raise ValueError('Для текста укажи канал: /an @канал текст')
         result = self.score_text(source, value)
         self.offer_index(sender, source, None, value, result)
-        return (f'Сравнение с базой {self.archive.indexed_count(source)} постов:\n'
-                + result)
+        return result
 
     async def index(self, source):
         if self.mode == 'minilm' and self.encoder is None:

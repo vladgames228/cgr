@@ -1,12 +1,11 @@
 import json
-import math
 import os
 import secrets
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .analysis import content, corpus_counts, deserialize, extract, novelty, phrases, semantic, serialize, words
+from .analysis import content, corpus_counts, deserialize, extract, novelty, phrases, semantic, serialize, word_novelty, words
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -231,33 +230,27 @@ class Archive:
         owned_terms, owned_phrases = per_post.get(exclude, (set(), set()))
         if not others:
             return {'overall': 100, 'words': 100, 'phrases': 100, 'theme': None,
-                    'closest': None, 'model_pending': False}
+                    'model_pending': False}
         normalized = words(text)
         for row in rows:
             if row['id'] != exclude and words(row['original']) == normalized:
                 return {'overall': 0, 'words': 0, 'phrases': 0,
-                        'theme': 0 if self.encoder else None, 'closest': row['id'],
+                        'theme': 0 if self.encoder else None,
                         'model_pending': False}
-        vocabulary = novelty(terms, term_counts, owned_terms, others, max(2, math.ceil(others * 0.02)))
+        vocabulary = word_novelty(terms, term_counts, owned_terms, others)
         expressions = novelty(combinations, phrase_counts, owned_phrases, others, 1)
-        theme, closest, pending = None, None, False
+        theme, pending = None, False
         if self.encoder:
             pending = any(words(row['original']) and not deserialize(row['features']).get('vectors')
                           for row in rows if row['id'] != exclude)
             if not pending:
-                theme, closest = semantic(extract(text, self.encoder)['vectors'], rows, exclude)
-        if closest is None and terms:
-            query = set(terms)
-            closest = max((row['id'] for row in rows if row['id'] != exclude),
-                          key=lambda post: len(query & per_post[post][0]), default=None)
-            if closest is not None and not (query & per_post[closest][0]):
-                closest = None
+                theme = semantic(extract(text, self.encoder)['vectors'], rows, exclude)
         measures = [vocabulary, expressions]
         if theme is not None:
             measures.append(theme)
         overall = min(measures)
         return {'overall': overall, 'words': vocabulary, 'phrases': expressions,
-                'theme': theme, 'closest': closest, 'model_pending': pending}
+                'theme': theme, 'model_pending': pending}
 
     def indexed_count(self, source):
         return self.db.execute('SELECT count(*) FROM posts WHERE source = ?', (source,)).fetchone()[0]

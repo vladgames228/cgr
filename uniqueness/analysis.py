@@ -71,6 +71,17 @@ def novelty(items, counts, owned, total, common):
     return round(100 * sum(counts[item] - (item in owned) < common for item in items) / len(items))
 
 
+def word_novelty(items, counts, owned, total):
+    if not items or not total:
+        return 100
+    common = max(2, (total + 49) // 50)
+    rarity = {item: min(1, max(0, 1 - (counts[item] - (item in owned) - 1) / (common - 1)))
+              for item in items}
+    familiar = sorted(rarity.values())[:4]
+    return round(100 * (0.7 * sum(familiar) / len(familiar)
+                        + 0.3 * sum(rarity[item] for item in items) / len(items)))
+
+
 def corpus_counts(rows):
     terms, combinations = Counter(), Counter()
     per_post = {}
@@ -89,20 +100,18 @@ def semantic(query_vectors, rows, excluded=None):
 
     query = np.asarray(query_vectors, dtype=np.float32)
     if not query.size:
-        return None, None
+        return None
     query /= np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1)
-    vectors, owners = [], []
+    vectors = []
     for row in rows:
         if row['id'] == excluded:
             continue
         stored = deserialize(row['features']).get('vectors', [])
         vectors.extend(stored)
-        owners.extend([row['id']] * len(stored))
     if not vectors:
-        return None, None
+        return None
     reference = np.asarray(vectors, dtype=np.float32)
     reference /= np.maximum(np.linalg.norm(reference, axis=1, keepdims=True), 1)
     closest = query @ reference.T
     best = closest.max(axis=1)
-    strongest = int(closest.argmax(axis=1)[best.argmax()])
-    return round(100 * sum(best < 0.82) / len(best)), owners[strongest]
+    return round(100 * np.clip((0.82 - best) / 0.22, 0, 1).mean())
