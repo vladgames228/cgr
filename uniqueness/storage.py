@@ -175,7 +175,7 @@ class Archive:
             db.execute('UPDATE channels SET cursor = ?, scan_count = scan_count + 1 WHERE source = ?',
                        (post, source))
 
-    def add_reference(self, source, post, original):
+    def add_reference(self, source, post, original, *, encode=True):
         if self.state(source) is None:
             raise ValueError('Канал не настроен')
         if not original or not words(original):
@@ -185,14 +185,14 @@ class Archive:
                 row = self.db.execute('SELECT MIN(id) FROM posts WHERE source = ? AND id < 0',
                                       (source,)).fetchone()
                 post = min(0, row[0] or 0) - 1
-            return self._store_post(source, post, original)
+            return self._store_post(source, post, original, encode=encode)
 
-    def _store_post(self, source, post, original):
+    def _store_post(self, source, post, original, *, encode=True):
         if not words(original):
             return False
         if self.db.execute('SELECT 1 FROM posts WHERE source = ? AND id = ?', (source, post)).fetchone():
             return False
-        packed = serialize(extract(original, self.encoder))
+        packed = serialize(extract(original, self.encoder if encode else None))
         self.db.execute('INSERT INTO posts VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                         (source, post, original, packed, 0, 0, 0, 0))
         self._corpus_cache.pop(source, None)
@@ -230,13 +230,13 @@ class Archive:
         owned_terms, owned_phrases = per_post.get(exclude, (set(), set()))
         if not others:
             return {'overall': 100, 'words': 100, 'phrases': 100, 'theme': None,
-                    'model_pending': False}
+                    'model_pending': False, 'similar_post': None, 'similarity': 0}
         normalized = words(text)
         for row in rows:
             if row['id'] != exclude and words(row['original']) == normalized:
                 return {'overall': 0, 'words': 0, 'phrases': 0,
                         'theme': 0 if self.encoder else None,
-                        'model_pending': False}
+                        'model_pending': False, 'similar_post': row['id'], 'similarity': 100}
         vocabulary = word_novelty(terms, term_counts, owned_terms, others)
         expressions = novelty(combinations, phrase_counts, owned_phrases, others, 1)
         theme, pending = None, False
@@ -249,8 +249,30 @@ class Archive:
         if theme is not None:
             measures.append(theme)
         overall = min(measures)
+        own_words, own_phrases = set(terms), set(combinations)
+        similar_post, similarity = None, 0
+        if own_words:
+            for post, (other_words, other_phrases) in per_post.items():
+                if post == exclude or not other_words:
+                    continue
+                word_match = len(own_words & other_words) / len(own_words | other_words)
+                phrase_match = (len(own_phrases & other_phrases) / len(own_phrases | other_phrases)
+                                if own_phrases and other_phrases else 0)
+                match = round(100 * ((word_match + phrase_match) / 2 if own_phrases else word_match))
+                if match > similarity:
+                    similar_post, similarity = post, match
         return {'overall': overall, 'words': vocabulary, 'phrases': expressions,
-                'theme': theme, 'model_pending': pending}
+                'theme': theme, 'model_pending': pending,
+                'similar_post': similar_post, 'similarity': similarity}
+
+    def statistics(self, source):
+        rows, terms, expressions, _ = self._corpus(source)
+        return len(rows), terms.most_common(8), expressions.most_common(5)
+
+    def post_text(self, source, post):
+        row = self.db.execute('SELECT original FROM posts WHERE source = ? AND id = ?',
+                              (source, post)).fetchone()
+        return row['original'] if row else None
 
     def indexed_count(self, source):
         return self.db.execute('SELECT count(*) FROM posts WHERE source = ?', (source,)).fetchone()[0]

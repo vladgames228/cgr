@@ -11,7 +11,7 @@ from uniqueness.analysis import semantic, serialize
 from uniqueness.control import Control
 from uniqueness.storage import Archive
 from uniqueness.telegram import Telegram
-from uniqueness.worker import Incoming, Route, deliver, index_batch
+from uniqueness.worker import Incoming, Route, Undeliverable, deliver, index_batch
 
 
 def peer(identifier):
@@ -132,7 +132,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.peer, self.route.destination)
         self.assertEqual(request.reply_to.reply_to_msg_id, 41)
 
-    async def test_an_repeats_and_responds_to_forward(self):
+    async def test_plain_messages_and_forwards_are_analyzed(self):
         self.archive.index(1, 1, '2025', 'Исходный текст для сравнения.')
         message = SimpleNamespace(message='Исходный текст для сравнения.')
         user = SimpleNamespace(get_messages=AsyncMock(return_value=message),
@@ -147,7 +147,6 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Уникальность в канале:', await control.analyze('Другой текст для сравнения.'))
         self.assertEqual(self.archive.queue_size(1), 0)
 
-        await control.dispatch('/an', sender=100)
         event = SimpleNamespace(sender_id=100, is_private=True, raw_text='пересланный текст',
                                 message=SimpleNamespace(fwd_from=SimpleNamespace(
                                     from_id=types.PeerChannel(1), channel_post=2)),
@@ -172,7 +171,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_text_is_indexed_without_background_progress(self):
         control = self.control(SimpleNamespace())
-        event = SimpleNamespace(sender_id=100, is_private=True, raw_text='/an Текст вручную.',
+        event = SimpleNamespace(sender_id=100, is_private=True, raw_text='Текст вручную.',
                                 message=SimpleNamespace(fwd_from=None), respond=AsyncMock())
         await control.handle(event)
         button = event.respond.await_args.kwargs['buttons'][0][0]
@@ -184,6 +183,50 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.state(1)['scan_count'], 0)
         self.assertEqual(self.archive.queue_size(1), 0)
         self.assertIn('Уникальность в канале:', await control.analyze('Текст вручную.'))
+
+    async def test_reverse_label_and_stats(self):
+        self.archive.index(1, 1, '2025', 'Ненавижу мужчин.')
+        self.archive.index(1, 2, '2025', 'Ненавижу мужчин снова.')
+        control = self.control(SimpleNamespace())
+        self.assertEqual(control.score_text(1, 'Я ненавижу мужчин'),
+                         'Уникальность в канале: 0%')
+        self.assertIn('Частые основы слов', await control.dispatch('/stat'))
+        self.assertIn('ненавиж', await control.dispatch('/stat'))
+        await control.dispatch('/reverse on')
+        self.assertEqual(control.score_text(1, 'Документация компилятора.'),
+                         'Повторяемость в канале: 0%')
+        await control.dispatch('/label Шанс слопа')
+        self.assertEqual(control.score_text(1, 'Я ненавижу мужчин'), 'Шанс слопа: 100%')
+        restarted = self.control(SimpleNamespace())
+        self.assertEqual(restarted.score_text(1, 'Я ненавижу мужчин'), 'Шанс слопа: 100%')
+        await control.dispatch('/label reset')
+        await control.dispatch('/reverse off')
+        self.assertEqual(control.score_text(1, 'Я ненавижу мужчин'),
+                         'Уникальность в канале: 0%')
+
+    async def test_live_capture_keeps_post_before_history_scan(self):
+        control = self.control(SimpleNamespace())
+        event = SimpleNamespace(message=SimpleNamespace(
+            peer_id=types.PeerChannel(1), id=10, message='Быстро удалённый пост.'))
+        await control.capture(event)
+        self.assertEqual(self.archive.indexed_count(1), 1)
+        self.assertEqual(self.archive.state(1)['cursor'], 0)
+        self.assertEqual(self.archive.state(1)['scan_count'], 0)
+        await control.capture(event)
+        self.assertEqual(self.archive.indexed_count(1), 1)
+        user = SimpleNamespace(get_messages=AsyncMock(return_value=None),
+                               get_input_entity=AsyncMock(return_value=peer(1)))
+
+        async def call(identity, operation, *args, **kwargs):
+            return await operation(*args, **kwargs)
+
+        control.telegram = SimpleNamespace(user=user, call=call)
+        self.assertIn('Уникальность в канале:',
+                      await control.analyze('https://t.me/source_channel/10'))
+        self.archive.set_route_active(1, 0)
+        event.message.id = 11
+        await control.capture(event)
+        self.assertEqual(self.archive.indexed_count(1), 1)
 
     async def test_link_checks_whole_channel_except_itself(self):
         self.archive.index(1, 1, '2025', 'Повторяемый тезис про мужчин.')
@@ -199,8 +242,11 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
 
         control = self.control(SimpleNamespace(user=user, call=call))
         answer = await control.analyze('https://t.me/source_channel/1')
-        self.assertEqual(answer, 'Уникальность в канале: 0%')
-        self.assertEqual(await control.analyze('Повторяемый тезис про мужчин.'), answer)
+        self.assertTrue(answer.startswith('Уникальность в канале: 0%\n'))
+        self.assertIn('Похожий пост (100%): https://t.me/source_channel/3', answer)
+        self.assertIn('Похожий пост (100%)', await control.analyze('Повторяемый тезис про мужчин.'))
+        self.assertEqual(control.score_text(1, 'Повторяемый тезис про мужчин.'),
+                         'Уникальность в канале: 0%')
         self.assertLessEqual(self.archive.analyze(1, 'Совсем другая публикация.', exclude=2)['words'], 100)
 
     async def test_channel_frequency_and_semantic_coverage(self):
@@ -218,6 +264,12 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         familiar = self.archive.analyze(
             1, 'Мужчины обижены ругаются повторяют новый научный протокол исследования.')
         self.assertLessEqual(familiar['overall'], 30)
+        longer = self.archive.analyze(
+            1, 'Мужчины обижены ругаются повторяют научный протокол компилятора '
+               'асинхронный архив датчик микросхема процессор инструкция функция '
+               'параметр модуль интерфейс библиотека объект аргумент схема '
+               'формат результат алгоритм таблица запрос сеть')
+        self.assertGreater(longer['overall'], familiar['overall'])
         self.assertEqual(self.archive.analyze(
             1, 'Документация компилятора описывает асинхронный протокол.')['overall'], 100)
 
@@ -299,7 +351,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         telegram = SimpleNamespace(send_text=AsyncMock(return_value=50),
                                    send_report=AsyncMock(return_value=51))
         control = self.control(telegram)
-        event = SimpleNamespace(sender_id=100, is_private=True, raw_text='/an Проверяемый текст.',
+        event = SimpleNamespace(sender_id=100, is_private=True, raw_text='Проверяемый текст.',
                                 message=SimpleNamespace(fwd_from=None), respond=AsyncMock())
         await control.handle(event)
         button = event.respond.await_args.kwargs['buttons'][0][1]
@@ -312,6 +364,30 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.queue_size(1), 0)
         await control.handle_button(callback)
         self.assertIn('Уже опубликовано', callback.answer.await_args.args[0])
+
+    async def test_deleted_post_can_be_published_from_saved_text(self):
+        self.archive.add_reference(1, 10, 'Сохранённый текст поста.')
+        user = SimpleNamespace(get_messages=AsyncMock(return_value=None),
+                               get_input_entity=AsyncMock(return_value=peer(1)))
+
+        async def call(identity, operation, *args, **kwargs):
+            return await operation(*args, **kwargs)
+
+        telegram = SimpleNamespace(user=user, call=call,
+                                   forward=AsyncMock(side_effect=Undeliverable('удалён')),
+                                   send_text=AsyncMock(return_value=50),
+                                   send_report=AsyncMock(return_value=51))
+        control = self.control(telegram)
+        event = SimpleNamespace(sender_id=100, is_private=True,
+                                raw_text='https://t.me/source_channel/10',
+                                message=SimpleNamespace(fwd_from=None), respond=AsyncMock())
+        await control.handle(event)
+        button = event.respond.await_args.kwargs['buttons'][0][1]
+        callback = SimpleNamespace(sender_id=100, is_private=True, data=button.data,
+                                   answer=AsyncMock())
+        await control.handle_button(callback)
+        telegram.send_text.assert_awaited_once()
+        self.assertEqual(telegram.send_report.await_args.args[1], 50)
 
     async def test_queue_pause_and_clear(self):
         self.archive.enqueue(1, 5, 'Оценка')

@@ -10,7 +10,7 @@ from telethon import Button, errors, types
 from .analysis import words
 from .encoder import Encoder, ensure_model
 from .telegram import RetryLater, channel_reference
-from .worker import Route, deliver, index_batch
+from .worker import ForwardRestricted, Route, Undeliverable, deliver, index_batch
 
 LOG = logging.getLogger(__name__)
 POST_LINK = re.compile(r'(?:https?://)?t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,31})/(\d+)(?:\?.*)?')
@@ -21,7 +21,10 @@ HELP = (
     '/post on|off — копировать новые посты и отвечать оценкой в моём канале\n'
     '/index on|off|rebuild — сбор базы или пересборка с начала\n'
     '/llm on|off — включить или выключить MiniLM\n'
-    '/an — проверить ссылку, пересланный пост или текст в личке\n'
+    'Для проверки пришли ссылку, перешли пост или отправь текст\n'
+    '/reverse on|off — поменять направление процентов\n'
+    '/label текст — изменить подпись к проценту\n'
+    '/stat — частые слова и выражения в базе\n'
     '/status — режимы, прогресс, очередь и ошибки\n'
     '/queue — очередь; /queue clear|pause|resume — управление\n'
     '/stop — остановить публикацию, индексацию и очередь'
@@ -40,7 +43,6 @@ class Control:
         self.model_error = None
         self.routes = {}
         self.count_cache = {}
-        self.waiting = set()
         self.index_offers = {}
         self.last_offer = {}
         self.posting_offers = set()
@@ -124,11 +126,22 @@ class Control:
             raise ValueError('Нужна ссылка на канал')
         return peer.channel_id
 
-    def score_text(self, source, text, exclude=None):
+    def score_text(self, source, text, exclude=None, *, detailed=False):
         if not text or not words(text):
             return 'У поста нет слов для оценки.'
         scores = self.archive.analyze(source, text, exclude)
-        return f'Уникальность в канале: {scores["overall"]}%'
+        reverse = self.archive.setting('reverse', 'off') == 'on'
+        label = self.archive.setting('label', '') or ('Повторяемость в канале' if reverse else 'Уникальность в канале')
+        value = 100 - scores['overall'] if reverse else scores['overall']
+        result = f'{label}: {value}%'
+        if detailed and scores['similarity'] > 60:
+            post = scores['similar_post']
+            name = self.archive.setting(f'route_name:{source}', '').split(' → ', 1)[0]
+            link = ('ручной образец' if post < 0 else
+                    f'https://t.me/{name[1:]}/{post}' if name.startswith('@') else
+                    f'https://t.me/c/{source}/{post}')
+            result += f'\nПохожий пост ({scores["similarity"]}%): {link}'
+        return result
 
     @staticmethod
     def ram_mb():
@@ -156,17 +169,17 @@ class Control:
     async def analyze(self, value=None, forward=None, sender=None):
         if not self.routes:
             raise ValueError('Сначала выбери каналы: /channel @источник @мой_канал')
-        if forward and isinstance(forward.from_id, types.PeerChannel) and forward.channel_post:
+        if (forward and isinstance(forward.from_id, types.PeerChannel)
+                and forward.channel_post and forward.from_id.channel_id in self.routes):
             source = forward.from_id.channel_id
-            if source not in self.routes:
-                raise ValueError('Пересланный пост не из настроенного канала')
             post = forward.channel_post
             text = await self.telegram.call('user', self.telegram.user.get_messages,
                                             self.routes[source].source, ids=post)
-            if text is None:
+            original = text.message if text else self.archive.post_text(source, post)
+            if original is None:
                 raise ValueError('Пост не найден')
-            result = self.score_text(source, text.message, post)
-            self.offer_index(sender, source, post, text.message, result)
+            result = self.score_text(source, original, post, detailed=True)
+            self.offer_index(sender, source, post, original, result.split('\n', 1)[0])
             return result
         value = (value or '').strip()
         public = POST_LINK.fullmatch(value)
@@ -180,10 +193,11 @@ class Control:
             post = int(match[2])
             item = await self.telegram.call('user', self.telegram.user.get_messages,
                                             self.routes[source].source, ids=post)
-            if item is None:
+            original = item.message if item else self.archive.post_text(source, post)
+            if original is None:
                 raise ValueError('Пост не найден')
-            result = self.score_text(source, item.message, post)
-            self.offer_index(sender, source, post, item.message, result)
+            result = self.score_text(source, original, post, detailed=True)
+            self.offer_index(sender, source, post, original, result.split('\n', 1)[0])
             return result
         if value.startswith(('t.me/', 'https://t.me/', 'http://t.me/')):
             raise ValueError('Пришли ссылку на отдельный пост, например https://t.me/channel/123')
@@ -196,9 +210,9 @@ class Control:
         elif len(self.routes) == 1:
             source = next(iter(self.routes))
         if source not in self.routes:
-            raise ValueError('Для текста укажи канал: /an @канал текст')
-        result = self.score_text(source, value)
-        self.offer_index(sender, source, None, value, result)
+            raise ValueError('Для текста укажи канал: @канал текст')
+        result = self.score_text(source, value, detailed=True)
+        self.offer_index(sender, source, None, value, result.split('\n', 1)[0])
         return result
 
     async def index(self, source):
@@ -233,6 +247,20 @@ class Control:
             count += 1
         return count == 20
 
+    async def capture(self, event):
+        peer = getattr(event.message, 'peer_id', None)
+        if not isinstance(peer, types.PeerChannel):
+            return
+        source = peer.channel_id
+        text = getattr(event.message, 'message', None)
+        if source not in self.routes or not self.archive.route_active(source) or not text or not words(text):
+            return
+        try:
+            self.archive.add_reference(source, event.message.id, text, encode=False)
+        except Exception as exc:
+            LOG.exception('Не удалось сохранить новый пост %s/%s', source, event.message.id)
+            self.archive.remember_error(source, f'Новый пост: {type(exc).__name__}: {exc}')
+
     async def deliver(self, source):
         if self.mode == 'minilm' and self.encoder is None:
             return False
@@ -256,6 +284,9 @@ class Control:
         lines.append(f'🗃 База: {self.archive.size_mb():.1f} МБ')
         if self.model_error:
             lines.append(f'⚠️ Модель: {self.model_error[:250]}')
+        reverse = self.archive.setting('reverse', 'off') == 'on'
+        label = self.archive.setting('label', '') or ('Повторяемость в канале' if reverse else 'Уникальность в канале')
+        lines.append(f'📊 {label}: 100% = {"повтор" if reverse else "новый текст"}')
         for source, route in self.routes.items():
             row = self.archive.state(source)
             try:
@@ -286,8 +317,6 @@ class Control:
         command, _, argument = text.strip().partition(' ')
         command = command.lower().split('@', 1)[0]
         argument = argument.strip()
-        if command != '/an':
-            self.waiting.discard(sender)
         if command == '/stop':
             self.generation += 1
             self.archive.stop_all()
@@ -296,6 +325,34 @@ class Control:
             return HELP
         if command == '/status':
             return await self.status()
+        if command == '/stat':
+            if not self.routes:
+                return 'Сначала настрой канал: /channel @источник @мой_канал'
+            lines = []
+            for source in self.routes:
+                total, terms, expressions = self.archive.statistics(source)
+                name = self.archive.setting(f'route_name:{source}', f'-100{source}').split(' → ', 1)[0]
+                lines.append(f'{name}: {total} постов в базе')
+                lines.append('Частые основы слов (число постов): ' +
+                             (', '.join(f'{word} — {count}' for word, count in terms) or 'пока нет'))
+                lines.append('Повторяющиеся выражения: ' +
+                             (', '.join(f'{" ".join(phrase)} — {count}'
+                                        for phrase, count in expressions if count > 1) or 'пока нет'))
+                if self.encoder:
+                    lines.append(f'MiniLM: {self.archive.vector_count(source)}/{total} векторов')
+            return '\n'.join(lines)
+        if command == '/reverse':
+            if argument not in ('on', 'off'):
+                return 'Используй /reverse on или /reverse off.'
+            self.archive.set_setting('reverse', argument)
+            return 'Теперь 100% означает повтор.' if argument == 'on' else 'Теперь 100% означает новый текст.'
+        if command == '/label':
+            if not argument:
+                return 'Используй /label Новый текст или /label reset.'
+            if len(argument) > 80 or '\n' in argument or '\r' in argument:
+                return 'Подпись должна быть одной строкой до 80 символов.'
+            self.archive.set_setting('label', '' if argument == 'reset' else argument)
+            return 'Подпись сброшена.' if argument == 'reset' else f'Подпись: {argument}'
         if command == '/queue':
             if argument == 'clear':
                 return f'🧹 Из очереди убрано: {self.archive.clear_queue()}.'
@@ -309,11 +366,6 @@ class Control:
                 return 'Используй /queue, /queue clear, /queue pause или /queue resume.'
             return '\n'.join(f'{self.archive.setting(f"route_name:{s}", f"-100{s}")}: '
                              f'{self.archive.queue_size(s)} ожидают' for s in self.routes) or 'Очередь пуста.'
-        if command == '/an':
-            if not argument:
-                self.waiting.add(sender)
-                return 'Пришли ссылку на пост, перешли пост или вставь текст. Отвечу здесь.'
-            return await self.analyze(argument, sender=sender)
         async with self.command_lock:
             if command == '/channel':
                 if len(argument.split()) != 2:
@@ -355,16 +407,12 @@ class Control:
         self.last_offer.pop(event.sender_id, None)
         raw = (event.raw_text or '').strip()
         try:
-            if event.sender_id in self.waiting and getattr(event.message, 'fwd_from', None):
-                self.waiting.discard(event.sender_id)
+            if getattr(event.message, 'fwd_from', None):
                 answer = await self.analyze(raw, event.message.fwd_from, event.sender_id)
             elif raw.startswith('/'):
                 answer = await self.dispatch(raw, event.sender_id)
-            elif event.sender_id in self.waiting:
-                self.waiting.discard(event.sender_id)
-                answer = await self.analyze(raw, getattr(event.message, 'fwd_from', None), event.sender_id)
             else:
-                return
+                answer = await self.analyze(raw, sender=event.sender_id) if raw else None
         except Exception as exc:
             LOG.exception('Ошибка команды администратора')
             answer = f'⚠️ {type(exc).__name__}: {exc}'
@@ -385,7 +433,7 @@ class Control:
         token = raw_token.decode('ascii', errors='ignore')
         offer = self.index_offers.get(token) if action in (b'idx', b'post') else None
         if not offer or offer[0] != event.sender_id:
-            await event.answer('Анализ устарел. Повтори /an.', alert=True)
+            await event.answer('Анализ устарел. Отправь текст или ссылку ещё раз.', alert=True)
             return
         try:
             if action == b'idx':
@@ -408,11 +456,13 @@ class Control:
                         if post is None:
                             published = await self.telegram.send_text(route, text, random_post)
                         else:
-                            from .worker import ForwardRestricted
                             try:
-                                published = await self.telegram.forward(route, post, random_post)
-                            except ForwardRestricted:
-                                published = await self.telegram.copy(route, post, random_post)
+                                try:
+                                    published = await self.telegram.forward(route, post, random_post)
+                                except ForwardRestricted:
+                                    published = await self.telegram.copy(route, post, random_post)
+                            except Undeliverable:
+                                published = await self.telegram.send_text(route, text, random_post)
                         self.post_progress[token][2] = published
                     await self.telegram.send_report(route, published, result, random_report)
                     self.posted_offers.add(token)

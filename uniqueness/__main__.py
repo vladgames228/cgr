@@ -79,7 +79,7 @@ async def serve(config, check=False):
     poll = max(5, int(os.environ.get('POLL_SECONDS', '30')))
     admins = admin_ids(os.environ.get('TG_ADMIN_IDS', ''))
     archive = Archive(config.data / 'archive.sqlite3')
-    user = client(config.data / 'reader', config.api_id, config.api_hash)
+    user = client(config.data / 'reader', config.api_id, config.api_hash, updates=not check)
     bot = client(config.data / f'bot-{bot_id}', config.api_id, config.api_hash, updates=not check)
     try:
         telegram = Telegram(user, archive)
@@ -104,8 +104,10 @@ async def serve(config, check=False):
                     types.BotCommand('post', 'Публикация on/off'),
                     types.BotCommand('index', 'Индексация on/off/rebuild'),
                     types.BotCommand('llm', 'MiniLM on/off'),
-                    types.BotCommand('an', 'Проверить пост или текст'),
                     types.BotCommand('status', 'Режимы, прогресс и ошибки'),
+                    types.BotCommand('stat', 'Частые слова и выражения'),
+                    types.BotCommand('reverse', 'Направление процентов on/off'),
+                    types.BotCommand('label', 'Подпись к процентам'),
                     types.BotCommand('queue', 'Очередь и управление'),
                     types.BotCommand('stop', 'Остановить всё'),
                 ]))
@@ -113,6 +115,8 @@ async def serve(config, check=False):
             LOG.warning('Не удалось установить меню команд Telegram: %s', exc)
         bot.add_event_handler(control.handle, events.NewMessage(incoming=True, func=lambda e: e.is_private))
         bot.add_event_handler(control.handle_button, events.CallbackQuery())
+        bot.add_event_handler(control.capture, events.NewMessage(incoming=True))
+        user.add_event_handler(control.capture, events.NewMessage(incoming=True))
 
         async def warm():
             try:

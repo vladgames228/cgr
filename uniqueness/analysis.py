@@ -78,8 +78,8 @@ def word_novelty(items, counts, owned, total):
     rarity = {item: min(1, max(0, 1 - (counts[item] - (item in owned) - 1) / (common - 1)))
               for item in items}
     familiar = sorted(rarity.values())[:4]
-    return round(100 * (0.7 * sum(familiar) / len(familiar)
-                        + 0.3 * sum(rarity[item] for item in items) / len(items)))
+    return round(100 * (0.45 * sum(familiar) / len(familiar)
+                        + 0.55 * sum(rarity[item] for item in items) / len(items)))
 
 
 def corpus_counts(rows):
