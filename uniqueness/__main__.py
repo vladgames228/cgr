@@ -9,7 +9,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from telethon import errors, events
+from telethon import errors, events, functions, types
 
 from .control import Control, admin_ids
 from .storage import Archive, read_status
@@ -55,15 +55,16 @@ async def schedule(control, operation, idle, name):
                 continue
             try:
                 work_remains = await operation(source)
-            except (RetryLater, errors.RPCError, OSError, ValueError, asyncio.TimeoutError) as exc:
+            except RetryLater:
+                # Flood waits are expected; never send an alert to the same bot chat.
+                ready[source] = time.monotonic() + max(5, control.telegram.pause_remaining('user'),
+                                                       control.telegram.pause_remaining('bot'))
+            except Exception as exc:
                 failures[source] = failures.get(source, 0) + 1
                 delay = min(120, 2 ** min(failures[source], 7))
                 ready[source] = time.monotonic() + delay
                 LOG.warning('%s, источник %s: %s. Повтор через %s с', name, source, exc, delay)
-                try:
-                    await control.alert(source, name, exc)
-                except (OSError, sqlite3.Error, RetryLater, errors.RPCError) as alert_exc:
-                    LOG.warning('Уведомление об ошибке не доставлено: %s', alert_exc)
+                control.archive.remember_error(source, f'{name}: {type(exc).__name__}: {exc}')
             else:
                 failures.pop(source, None)
                 ready[source] = time.monotonic() + (0 if work_remains else idle)
@@ -81,7 +82,7 @@ async def serve(config, check=False):
     user = client(config.data / 'reader', config.api_id, config.api_hash)
     bot = client(config.data / f'bot-{bot_id}', config.api_id, config.api_hash, updates=not check)
     try:
-        telegram = Telegram(user, bot, archive)
+        telegram = Telegram(user, archive)
         while wait := max(telegram.pause_remaining('user'), telegram.pause_remaining('bot')):
             LOG.info('Пауза Telegram до повторного подключения, осталось %d с', wait + 1)
             await asyncio.sleep(wait)
@@ -92,40 +93,41 @@ async def serve(config, check=False):
         await telegram.call('bot', bot.start, bot_token=token)
         if (await telegram.call('bot', bot.get_me)).id != bot_id:
             raise ValueError('ID сессии бота не совпадает с токеном')
-        archive.pin('reader_id', reader.id)
-        archive.pin('bot_id', bot_id)
         control = Control(archive, telegram, config.model, admins)
         if check:
             await control.warm_model()
             return
+        try:
+            await telegram.call('bot', bot, functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopeDefault(), lang_code='', commands=[
+                    types.BotCommand('channel', 'Источник и мой канал'),
+                    types.BotCommand('post', 'Публикация on/off'),
+                    types.BotCommand('index', 'Индексация on/off'),
+                    types.BotCommand('llm', 'MiniLM on/off'),
+                    types.BotCommand('an', 'Проверить пост или текст'),
+                    types.BotCommand('status', 'Режимы, прогресс и ошибки'),
+                    types.BotCommand('queue', 'Очередь и управление'),
+                    types.BotCommand('stop', 'Остановить всё'),
+                ]))
+        except (OSError, errors.RPCError, RetryLater) as exc:
+            LOG.warning('Не удалось установить меню команд Telegram: %s', exc)
         bot.add_event_handler(control.handle, events.NewMessage(incoming=True, func=lambda e: e.is_private))
         bot.add_event_handler(control.handle_button, events.CallbackQuery())
 
         async def warm():
             try:
                 await control.warm_model()
-            except (ValueError, OSError, RuntimeError):
-                LOG.exception('Не удалось загрузить MiniLM. Проверьте образ или переключитесь на /mode classic.')
-                for admin in admins:
-                    try:
-                        await telegram.call('bot', bot.send_message, admin,
-                                            f'⚠️ MiniLM не загрузилась: {control.model_error}. Открой /errors.')
-                    except (OSError, errors.RPCError, RetryLater):
-                        pass
+            except Exception:
+                LOG.exception('Не удалось загрузить MiniLM. Ошибка доступна через /status.')
 
         try:
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(warm())
                 tasks.create_task(schedule(control, control.index, poll, 'Чтение'))
+                tasks.create_task(schedule(control, control.watch, poll, 'Новые посты'))
                 tasks.create_task(schedule(control, control.deliver, 2, 'Публикация'))
-        except Exception as exc:
+        except Exception:
             LOG.exception('Основной процесс остановился')
-            for admin in admins:
-                try:
-                    await telegram.call('bot', bot.send_message, admin,
-                                        f'🚨 Бот остановился: {type(exc).__name__}: {str(exc)[:1200]}')
-                except (OSError, errors.RPCError, RetryLater):
-                    pass
             raise
     finally:
         await asyncio.gather(user.disconnect(), bot.disconnect())

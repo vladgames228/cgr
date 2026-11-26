@@ -49,13 +49,11 @@ def sent_id(updates, random_id, target, *, single=True):
 
 
 class Telegram:
-    def __init__(self, user, bot, archive):
+    def __init__(self, user, archive):
         self.user = user
-        self.bot = bot
         self.archive = archive
         self.last_forwards = 0.0
         self.last_reports = {}
-        self.last_bot_send = 0.0
 
     def pause_remaining(self, identity):
         return max(0, self.archive.flood_until(identity) - time.time())
@@ -95,25 +93,8 @@ class Telegram:
             raise ValueError('Канал назначения совпадает с источником')
         if not (destination.creator or getattr(destination.admin_rights, 'post_messages', False)):
             raise ValueError(f'Пользовательской сессии нужно право публикации в {destination_name}')
-        full = await self.call('user', self.user, functions.channels.GetFullChannelRequest(destination))
-        group_id = full.full_chat.linked_chat_id
-        if not group_id:
-            raise ValueError(f'К каналу {destination_name} нужно привязать группу обсуждений')
-        discussion = next((chat for chat in full.chats if chat.id == group_id and
-                           isinstance(chat, types.Channel) and chat.megagroup), None)
-        if not discussion or discussion.left:
-            raise ValueError(f'Пользовательской сессии нужно вступить в группу обсуждений {group_id}')
-        try:
-            bot_group = await self.call('bot', self.bot.get_input_entity, types.PeerChannel(group_id))
-            membership = await self.call('bot', self.bot, functions.channels.GetParticipantRequest(
-                bot_group, types.InputPeerSelf()))
-        except (ValueError, errors.ChannelPrivateError, errors.UserNotParticipantError) as exc:
-            raise ValueError(f'Добавьте бота в группу обсуждений {group_id}') from exc
-        if isinstance(membership.participant, (types.ChannelParticipantLeft, types.ChannelParticipantBanned)):
-            raise ValueError(f'Боту нужен доступ к отправке сообщений в группе {group_id}')
         return Route(await self.user.get_input_entity(source),
-                     await self.user.get_input_entity(destination),
-                     await self.user.get_input_entity(discussion), bot_group)
+                     await self.user.get_input_entity(destination))
 
     async def head(self, source):
         messages = await self.call('user', self.user.get_messages, source, limit=1)
@@ -172,38 +153,16 @@ class Telegram:
             raise
         return sent_id(updates, random_id, route.destination)
 
-    async def discussion_root(self, route, forward):
-        try:
-            result = await self.call('user', self.user, functions.messages.GetDiscussionMessageRequest(
-                peer=route.destination, msg_id=forward))
-        except (errors.MsgIdInvalidError, errors.MessageIdInvalidError) as exc:
-            post = await self.call('user', self.user.get_messages, route.destination, ids=forward)
-            if post is None:
-                raise Undeliverable('пересланный пост удалён') from exc
-            raise RetryLater(f'Нет ветки обсуждения для пересланного поста {forward}') from exc
-        if not result.messages:
-            raise RetryLater(f'Telegram ещё не создал ветку для поста {forward}')
-        root = result.messages[-1]
-        if root.peer_id != types.PeerChannel(route.discussion.channel_id):
-            raise ValueError('Группа обсуждений назначения изменилась')
-        return root.id
-
-    async def send_report(self, route, root, report, random_id):
-        group_id = route.bot_discussion.channel_id
-        deadline = max(self.last_reports.get(group_id, 0) + REPORT_GAP, self.last_bot_send + 0.06)
+    async def send_report(self, route, forwarded_post, report, random_id):
+        channel_id = route.destination.channel_id
+        deadline = self.last_reports.get(channel_id, 0) + REPORT_GAP
         await asyncio.sleep(max(0, deadline - time.monotonic()))
-        self.last_reports[group_id] = self.last_bot_send = time.monotonic()
+        self.last_reports[channel_id] = time.monotonic()
         try:
-            updates = await self.call('bot', self.bot, functions.messages.SendMessageRequest(
-                peer=route.bot_discussion, message=report, random_id=random_id, silent=True,
-                no_webpage=True, reply_to=types.InputReplyToMessage(reply_to_msg_id=root),
+            updates = await self.call('user', self.user, functions.messages.SendMessageRequest(
+                peer=route.destination, message=report, random_id=random_id, silent=True,
+                no_webpage=True, reply_to=types.InputReplyToMessage(reply_to_msg_id=forwarded_post),
             ))
-        except errors.BadRequestError as exc:
-            missing_parent = isinstance(exc, (errors.MsgIdInvalidError, errors.MessageIdInvalidError))
-            if not missing_parent and exc.message != 'TOPIC_ID_INVALID':
-                raise
-            parent = await self.call('user', self.user.get_messages, route.discussion, ids=root)
-            if parent is None:
-                raise Undeliverable('ветка обсуждения удалена') from exc
-            raise
-        return sent_id(updates, random_id, route.bot_discussion)
+        except (errors.MsgIdInvalidError, errors.MessageIdInvalidError) as exc:
+            raise Undeliverable('пересланный пост недоступен для ответа') from exc
+        return sent_id(updates, random_id, route.destination)

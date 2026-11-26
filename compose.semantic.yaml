@@ -1,6 +1,6 @@
 # Совместимость со старыми командами docker compose -f compose.yaml -f compose.semantic.yaml.
 # Модель хранится в томе /data/model; локальный каталог поверх неё не подключается.
 services:
-  bot:
+  cgr:
     environment:
       TOKENIZERS_PARALLELISM: "false"
