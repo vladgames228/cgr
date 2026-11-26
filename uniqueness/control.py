@@ -464,7 +464,7 @@ class Control:
                             except Undeliverable:
                                 published = await self.telegram.send_text(route, text, random_post)
                         self.post_progress[token][2] = published
-                    await self.telegram.send_report(route, published, result, random_report)
+                    await self.telegram.send_report(route, published, result, random_report, text)
                     self.posted_offers.add(token)
                     self.post_progress.pop(token, None)
                 finally:

@@ -71,7 +71,8 @@ async def deliver(archive, telegram, route, should_continue=lambda: True):
             archive.update_job(source, post, forward=forward)
         if not should_continue() or not archive.job_pending(source, post):
             return False
-        result = await telegram.send_report(route, forward, job['result'], job['report_random'])
+        original = archive.post_text(source, post)
+        result = await telegram.send_report(route, forward, job['result'], job['report_random'], original)
         archive.update_job(source, post, result=result)
     except Undeliverable as exc:
         archive.update_job(source, post, skipped=str(exc))

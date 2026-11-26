@@ -153,18 +153,25 @@ class Telegram:
             raise
         return sent_id(updates, random_id, route.destination)
 
-    async def send_report(self, route, forwarded_post, report, random_id):
+    async def send_report(self, route, forwarded_post, report, random_id, original=None):
         channel_id = route.destination.channel_id
         deadline = self.last_reports.get(channel_id, 0) + REPORT_GAP
         await asyncio.sleep(max(0, deadline - time.monotonic()))
         self.last_reports[channel_id] = time.monotonic()
+        quote = ''
+        for character in original or '':
+            if len((quote + character).encode('utf-8')) > 900:
+                break
+            quote += character
+        reply = types.InputReplyToMessage(reply_to_msg_id=forwarded_post,
+                                          quote_text=quote or None, quote_offset=0 if quote else None)
         try:
             updates = await self.call('user', self.user, functions.messages.SendMessageRequest(
                 peer=route.destination, message=report, random_id=random_id, silent=True,
-                no_webpage=True, reply_to=types.InputReplyToMessage(reply_to_msg_id=forwarded_post),
+                no_webpage=True, reply_to=reply,
             ))
         except (errors.MsgIdInvalidError, errors.MessageIdInvalidError) as exc:
-            raise Undeliverable('пересланный пост недоступен для ответа') from exc
+            raise Undeliverable('пересланный пост недоступен для цитирования') from exc
         return sent_id(updates, random_id, route.destination)
 
     async def send_text(self, route, text, random_id):
