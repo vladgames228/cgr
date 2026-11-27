@@ -336,17 +336,20 @@ class Archive:
             return {'overall': 100, 'words': 100, 'phrases': 100, 'theme': None,
                     'model_pending': False, 'similar_post': None, 'similarity': 0}
         vocabulary = word_novelty(terms, term_counts, owned_terms, others)
-        expressions = novelty(combinations, phrase_counts, owned_phrases, others, 1)
+        expressions = novelty(combinations, phrase_counts, owned_phrases, others)
         theme, pending = None, False
         if self.encoder:
             pending = any(words(row['original']) and not deserialize(row['features']).get('vectors')
                           for row in rows if (row['source'], row['id']) != excluded)
             if not pending:
                 theme = semantic(extract(text, self.encoder)['vectors'], rows, excluded)
-        measures = [vocabulary, expressions]
-        if theme is not None:
-            measures.append(theme)
-        overall = min(measures)
+        overall = round(0.65 * vocabulary + 0.35 * expressions) if theme is None else round(
+            0.5 * vocabulary + 0.3 * expressions + 0.2 * theme)
+        if (terms and len(terms) <= 4
+                and all(term_counts[term] - (term in owned_terms) >= 1 for term in terms)
+                and (not combinations or any(phrase_counts[part] - (part in owned_phrases) >= 1
+                                             for part in combinations))):
+            overall = 0
         own_words, own_phrases = set(terms), set(combinations)
         similar_post, similarity = None, 0
         if own_words:

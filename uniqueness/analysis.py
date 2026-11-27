@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import math
 import re
 import unicodedata
 import zlib
@@ -66,21 +67,18 @@ def deserialize(blob):
     return json.loads(zlib.decompress(blob))
 
 
-def novelty(items, counts, owned, total, common):
+def novelty(items, counts, owned, total, share=0.03):
     if not items or not total:
         return 100
-    return round(100 * sum(counts[item] - (item in owned) < common for item in items) / len(items))
+    scale = math.log1p(max(2, total * share))
+    return round(100 * sum(1 - min(1, math.log1p(max(0, counts[item] - (item in owned))) / scale)
+                           for item in items) / len(items))
 
 
 def word_novelty(items, counts, owned, total):
     if not items or not total:
         return 100
-    common = max(2, (total + 49) // 50)
-    rarity = {item: min(1, max(0, 1 - (counts[item] - (item in owned) - 1) / (common - 1)))
-              for item in items}
-    familiar = sorted(rarity.values())[:4]
-    return round(100 * (0.45 * sum(familiar) / len(familiar)
-                        + 0.55 * sum(rarity[item] for item in items) / len(items)))
+    return novelty(items, counts, owned, total, share=0.08)
 
 
 def corpus_counts(rows):

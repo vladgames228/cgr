@@ -263,13 +263,14 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
                                f'Мужчины обижены ругаются повторяют тезис {post}.')
         familiar = self.archive.analyze(
             1, 'Мужчины обижены ругаются повторяют новый научный протокол исследования.')
-        self.assertLessEqual(familiar['overall'], 30)
+        self.assertLess(familiar['overall'], 70)
         longer = self.archive.analyze(
             1, 'Мужчины обижены ругаются повторяют научный протокол компилятора '
                'асинхронный архив датчик микросхема процессор инструкция функция '
                'параметр модуль интерфейс библиотека объект аргумент схема '
                'формат результат алгоритм таблица запрос сеть')
         self.assertGreater(longer['overall'], familiar['overall'])
+        self.assertLess(longer['overall'], 100)
         self.assertEqual(self.archive.analyze(
             1, 'Документация компилятора описывает асинхронный протокол.')['overall'], 100)
 
