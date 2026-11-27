@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -18,8 +19,12 @@ PRIVATE_LINK = re.compile(r'(?:https?://)?t\.me/c/(\d+)/(\d+)(?:\?.*)?')
 HELP = (
     'Бот собирает историю канала в базу. Публикация новых постов включается отдельно.\n\n'
     '/channel @источник @мой_канал — выбрать каналы\n'
-    '/post on|off — копировать новые посты и отвечать оценкой в моём канале\n'
-    '/index on|off|rebuild — сбор базы или пересборка с начала\n'
+    '/channel remove @источник — убрать канал из наблюдения, сохранив индекс\n'
+    '/group add @группа ID — следить за сообщениями автора\n'
+    '/group — список; /group recent ID — последние оценки; /group remove ID — убрать\n'
+    '/minwords N — минимум слов для индексации (по умолчанию 3)\n'
+    '/post on|off @источник — публикация новых постов\n'
+    '/index on|off @источник — индексация; /index rebuild @источник — пересборка\n'
     '/llm on|off — включить или выключить MiniLM\n'
     'Для проверки пришли ссылку, перешли пост или отправь текст\n'
     '/reverse on|off — поменять направление процентов\n'
@@ -42,6 +47,7 @@ class Control:
         self.model_state = 'выключена' if self.mode == 'classic' else 'загрузка'
         self.model_error = None
         self.routes = {}
+        self.groups = {}
         self.count_cache = {}
         self.index_offers = {}
         self.last_offer = {}
@@ -54,6 +60,10 @@ class Control:
         self.generation = 0
         for source, peers, _ in archive.route_records():
             self.routes[source] = Route(*(types.InputPeerChannel(*peer) for peer in peers[:2]))
+        for row in archive.groups():
+            kind, peer_id, access_hash = json.loads(row['peer'])
+            self.groups[row['id']] = (types.InputPeerChannel(peer_id, access_hash)
+                                      if kind == 'channel' else types.InputPeerChat(peer_id))
 
     async def warm_model(self):
         if self.mode == 'minilm':
@@ -101,12 +111,13 @@ class Control:
         head = await self.telegram.head(route.source)
         count = await self.telegram.count(route.source)
         old = self.archive.state(source)
+        publish_new = any(self.archive.state(item)['auto_publish'] for item in self.routes)
         peers = [(peer.channel_id, peer.access_hash) for peer in (route.source, route.destination)]
         self.archive.save_route(source, destination, peers, active=old['active'] if old else 1)
         if old is None:
             self.archive.set_route_active(source, 1)
-            self.archive.set_auto_publish(source, 0)
-            self.archive.set_delivery_enabled(source, 0)
+            self.archive.set_auto_publish(source, publish_new)
+            self.archive.set_delivery_enabled(source, publish_new)
             self.archive.set_posting_cursor(source, head)
         self.archive.set_setting(f'route_name:{source}', f'{source_ref} → {destination_ref}')
         self.routes[source] = route
@@ -126,20 +137,97 @@ class Control:
             raise ValueError('Нужна ссылка на канал')
         return peer.channel_id
 
+    async def selected_sources(self, reference):
+        if not reference:
+            return list(self.routes)
+        source = await self.source_id(reference)
+        if source not in self.routes:
+            raise ValueError('Источник не настроен. Список: /channel')
+        return [source]
+
+    async def group_command(self, argument):
+        parts = argument.split()
+        if not parts:
+            rows = self.archive.groups()
+            return ('\n'.join(f'{row["name"]} · ID {row["id"]} · автор {row["user_id"]} · '
+                              f'{"вкл" if row["active"] else "выкл"} · в базе '
+                              f'{self.archive.indexed_count(row["id"])}'
+                              for row in rows) or 'Групп пока нет. /group add @группа ID_автора')
+        action = parts[0].lower()
+        if action == 'add' and len(parts) == 3 and parts[2].isdigit():
+            entity, peer = await self.telegram.configure_group(parts[1])
+            if entity.id in self.routes:
+                raise ValueError('Эта группа уже используется как канал')
+            kind = 'channel' if isinstance(peer, types.InputPeerChannel) else 'chat'
+            descriptor = [kind, entity.id, getattr(peer, 'access_hash', 0)]
+            head = await self.telegram.head(peer)
+            self.archive.save_group(entity.id, descriptor, entity.title, int(parts[2]), head)
+            self.groups[entity.id] = peer
+            self.generation += 1
+            return f'👥 {entity.title}: слежу за автором {parts[2]}. Начинаю с новых сообщений.'
+        if action in ('remove', 'on', 'off', 'recent') and len(parts) == 2 and parts[1].isdigit():
+            group_id = int(parts[1])
+            row = self.archive.group(group_id)
+            if row is None or row['active'] < 0:
+                return 'Группа не найдена. Список: /group'
+            if action == 'recent':
+                items = self.archive.recent_group_results(group_id)
+                linkable = json.loads(row['peer'])[0] == 'channel'
+                return ('\n'.join(f'{result} · '
+                                  f'{f"https://t.me/c/{group_id}/{post}" if linkable else f"сообщение {post}"}'
+                                  for post, result in items) or 'Оценок пока нет.')
+            if action == 'remove':
+                self.archive.remove_group(group_id)
+                self.groups.pop(group_id, None)
+            else:
+                with self.archive.db as db:
+                    db.execute('UPDATE groups SET active = ? WHERE id = ?', (int(action == 'on'), group_id))
+            self.generation += 1
+            return f'👥 {row["name"]}: {"убрана" if action == "remove" else action}.'
+        return 'Используй /group add @группа ID_автора; /group recent ID; /group on|off|remove ID.'
+
+    async def watch_group(self, group_id):
+        row = self.archive.group(group_id)
+        if not row or not row['active']:
+            return False
+        peer = self.groups[group_id]
+        head = await self.telegram.head(peer)
+        if head <= row['cursor']:
+            if self.encoder:
+                return self.archive.fill_vectors(group_id)
+            return False
+        iterator = self.telegram.user.iter_messages(peer, min_id=row['cursor'], max_id=head + 1,
+                                                    reverse=True, limit=40)
+        count = 0
+        while True:
+            try:
+                item = await self.telegram.call('user', anext, iterator)
+            except StopAsyncIteration:
+                break
+            text = getattr(item, 'message', '') or ''
+            if item.sender_id == row['user_id'] and len(words(text)) >= int(self.archive.setting('min_words', 3)):
+                result = self.score_text(group_id, text)
+                self.archive.add_reference(group_id, item.id, text, encode=False)
+                self.archive.group_result(group_id, item.id, result)
+            self.archive.group_cursor(group_id, item.id)
+            count += 1
+        return count == 40
+
     def score_text(self, source, text, exclude=None, *, detailed=False):
         if not text or not words(text):
             return 'У поста нет слов для оценки.'
         scores = self.archive.analyze(source, text, exclude)
         reverse = self.archive.setting('reverse', 'off') == 'on'
-        label = self.archive.setting('label', '') or ('Повторяемость в канале' if reverse else 'Уникальность в канале')
+        place = 'группе' if self.archive.group(source) else 'канале'
+        label = self.archive.setting('label', '') or (f'Повторяемость в {place}' if reverse else f'Уникальность в {place}')
         value = 100 - scores['overall'] if reverse else scores['overall']
         result = f'{label}: {value}%'
         if detailed and scores['similarity'] > 60:
-            post = scores['similar_post']
-            name = self.archive.setting(f'route_name:{source}', '').split(' → ', 1)[0]
+            similar_source, post = scores['similar_post']
+            name = self.archive.setting(f'route_name:{similar_source}', '').split(' → ', 1)[0]
             link = ('ручной образец' if post < 0 else
                     f'https://t.me/{name[1:]}/{post}' if name.startswith('@') else
-                    f'https://t.me/c/{source}/{post}')
+                    f'https://t.me/c/{similar_source}/{post}')
             result += f'\nПохожий пост ({scores["similarity"]}%): {link}'
         return result
 
@@ -167,20 +255,21 @@ class Control:
             self.posted_offers.discard(expired)
 
     async def analyze(self, value=None, forward=None, sender=None):
-        if not self.routes:
+        if not self.routes and not self.archive.statistics(0)[0]:
             raise ValueError('Сначала выбери каналы: /channel @источник @мой_канал')
         if (forward and isinstance(forward.from_id, types.PeerChannel)
-                and forward.channel_post and forward.from_id.channel_id in self.routes):
+                and forward.channel_post):
             source = forward.from_id.channel_id
             post = forward.channel_post
-            text = await self.telegram.call('user', self.telegram.user.get_messages,
-                                            self.routes[source].source, ids=post)
+            text = (await self.telegram.call('user', self.telegram.user.get_messages,
+                                             self.routes[source].source, ids=post)
+                    if source in self.routes else None)
             original = text.message if text else self.archive.post_text(source, post)
-            if original is None:
-                raise ValueError('Пост не найден')
-            result = self.score_text(source, original, post, detailed=True)
-            self.offer_index(sender, source, post, original, result.split('\n', 1)[0])
-            return result
+            if original is not None:
+                result = self.score_text(source, original, post, detailed=True)
+                if source in self.routes:
+                    self.offer_index(sender, source, post, original, result.split('\n', 1)[0])
+                return result
         value = (value or '').strip()
         public = POST_LINK.fullmatch(value)
         private = PRIVATE_LINK.fullmatch(value)
@@ -188,16 +277,16 @@ class Control:
             match = public or private
             reference = '@' + public[1] if public else '-100' + private[1]
             source = await self.source_id(reference)
-            if source not in self.routes:
-                raise ValueError('Этот канал не настроен')
             post = int(match[2])
-            item = await self.telegram.call('user', self.telegram.user.get_messages,
-                                            self.routes[source].source, ids=post)
+            item = (await self.telegram.call('user', self.telegram.user.get_messages,
+                                             self.routes[source].source, ids=post)
+                    if source in self.routes else None)
             original = item.message if item else self.archive.post_text(source, post)
             if original is None:
-                raise ValueError('Пост не найден')
+                raise ValueError('Пост не найден в сохранённой базе')
             result = self.score_text(source, original, post, detailed=True)
-            self.offer_index(sender, source, post, original, result.split('\n', 1)[0])
+            if source in self.routes:
+                self.offer_index(sender, source, post, original, result.split('\n', 1)[0])
             return result
         if value.startswith(('t.me/', 'https://t.me/', 'http://t.me/')):
             raise ValueError('Пришли ссылку на отдельный пост, например https://t.me/channel/123')
@@ -207,8 +296,10 @@ class Control:
         if value.startswith('@') and ' ' in value:
             reference, value = value.split(' ', 1)
             source = await self.source_id(reference)
-        elif len(self.routes) == 1:
+        elif self.routes:
             source = next(iter(self.routes))
+        if source is None and self.archive.statistics(0)[0]:
+            return self.score_text(0, value, detailed=True)
         if source not in self.routes:
             raise ValueError('Для текста укажи канал: @канал текст')
         result = self.score_text(source, value, detailed=True)
@@ -253,7 +344,8 @@ class Control:
             return
         source = peer.channel_id
         text = getattr(event.message, 'message', None)
-        if source not in self.routes or not self.archive.route_active(source) or not text or not words(text):
+        if (source not in self.routes or not self.archive.route_active(source) or not text
+                or len(words(text)) < int(self.archive.setting('min_words', 3))):
             return
         try:
             self.archive.add_reference(source, event.message.id, text, encode=False)
@@ -270,8 +362,9 @@ class Control:
         lock = self.delivery_locks.setdefault(source, asyncio.Lock())
         async with lock:
             return await deliver(self.archive, self.telegram, self.routes[source],
-                                 should_continue=lambda: self.archive.state(source)['auto_publish']
-                                 and self.archive.delivery_enabled(source))
+                                 should_continue=lambda: bool(self.archive.state(source)
+                                                             and self.archive.state(source)['auto_publish']
+                                                             and self.archive.delivery_enabled(source)))
 
     async def status(self):
         lines = [f'📤 Публикация: {"вкл" if any(self.archive.state(s)["auto_publish"] for s in self.routes) else "выкл"}',
@@ -281,7 +374,8 @@ class Control:
             lines.append(f'🧠 Память MiniLM: ~{self.model_ram_mb:.0f} МБ')
         if ram := self.ram_mb():
             lines.append(f'💾 Память процесса: {ram:.0f} МБ')
-        lines.append(f'🗃 База: {self.archive.size_mb():.1f} МБ')
+        lines.append(f'🗃 База: {self.archive.size_mb():.1f} МБ; общий индекс каналов: '
+                     f'{self.archive.statistics(0)[0]} разных текстов')
         if self.model_error:
             lines.append(f'⚠️ Модель: {self.model_error[:250]}')
         reverse = self.archive.setting('reverse', 'off') == 'on'
@@ -311,6 +405,8 @@ class Control:
                 lines.append(f'⚠️ {error[:250]}')
         if not self.routes:
             lines.append('Каналы ещё не настроены. Начни с /channel @источник @мой_канал')
+        if self.groups:
+            lines.append(f'👥 Группы: {len(self.groups)}; минимум слов: {self.archive.setting("min_words", 3)}')
         return '\n'.join(lines)
 
     async def dispatch(self, text, sender=None):
@@ -326,12 +422,19 @@ class Control:
         if command == '/status':
             return await self.status()
         if command == '/stat':
-            if not self.routes:
-                return 'Сначала настрой канал: /channel @источник @мой_канал'
             lines = []
-            for source in self.routes:
+            total, terms, expressions = self.archive.statistics(0)
+            if total:
+                lines.append(f'Все каналы вместе: {total} разных текстов в базе')
+                lines.append('Частые основы слов (число постов): ' +
+                             (', '.join(f'{word} — {count}' for word, count in terms) or 'пока нет'))
+                lines.append('Повторяющиеся выражения: ' +
+                             (', '.join(f'{" ".join(phrase)} — {count}'
+                                        for phrase, count in expressions) or 'пока нет'))
+            for source in self.groups:
                 total, terms, expressions = self.archive.statistics(source)
-                name = self.archive.setting(f'route_name:{source}', f'-100{source}').split(' → ', 1)[0]
+                group = self.archive.group(source)
+                name = group['name'] if group else self.archive.setting(f'route_name:{source}', f'-100{source}').split(' → ', 1)[0]
                 lines.append(f'{name}: {total} постов в базе')
                 lines.append('Частые основы слов (число постов): ' +
                              (', '.join(f'{word} — {count}' for word, count in terms) or 'пока нет'))
@@ -340,7 +443,7 @@ class Control:
                                         for phrase, count in expressions if count > 1) or 'пока нет'))
                 if self.encoder:
                     lines.append(f'MiniLM: {self.archive.vector_count(source)}/{total} векторов')
-            return '\n'.join(lines)
+            return '\n'.join(lines) or 'База пока пуста.'
         if command == '/reverse':
             if argument not in ('on', 'off'):
                 return 'Используй /reverse on или /reverse off.'
@@ -353,6 +456,13 @@ class Control:
                 return 'Подпись должна быть одной строкой до 80 символов.'
             self.archive.set_setting('label', '' if argument == 'reset' else argument)
             return 'Подпись сброшена.' if argument == 'reset' else f'Подпись: {argument}'
+        if command == '/minwords':
+            if not argument:
+                return f'Минимум слов для новых сообщений: {self.archive.setting("min_words", 3)}. /minwords N'
+            if not argument.isdigit() or not 1 <= int(argument) <= 100:
+                return 'Укажи число от 1 до 100: /minwords 5'
+            self.archive.apply_min_words(int(argument))
+            return f'Теперь индексируются сообщения от {argument} слов. Старые записи сохранены.'
         if command == '/queue':
             if argument == 'clear':
                 return f'🧹 Из очереди убрано: {self.archive.clear_queue()}.'
@@ -367,28 +477,50 @@ class Control:
             return '\n'.join(f'{self.archive.setting(f"route_name:{s}", f"-100{s}")}: '
                              f'{self.archive.queue_size(s)} ожидают' for s in self.routes) or 'Очередь пуста.'
         async with self.command_lock:
+            if command == '/group':
+                return await self.group_command(argument)
             if command == '/channel':
-                if len(argument.split()) != 2:
-                    return 'Пришли /channel @источник @мой_канал'
+                parts = argument.split()
+                if not parts:
+                    return ('\n'.join(f'{self.archive.setting(f"route_name:{source}", f"-100{source}")}: '
+                                      f'индекс {"вкл" if self.archive.route_active(source) else "выкл"}, '
+                                      f'постинг {"вкл" if self.archive.state(source)["auto_publish"] else "выкл"}'
+                                      for source in self.routes) or 'Каналов пока нет.')
+                if len(parts) == 2 and parts[0].lower() == 'remove':
+                    source = (await self.selected_sources(parts[1]))[0]
+                    self.archive.remove_route(source)
+                    self.routes.pop(source)
+                    self.count_cache.pop(source, None)
+                    self.generation += 1
+                    return 'Источник убран из наблюдения. Его проиндексированные тексты остались в общей базе.'
+                if len(parts) != 2:
+                    return 'Пришли /channel @источник @мой_канал или /channel remove @источник'
                 return await self.channel(*argument.split())
-            if command == '/index' and argument == 'rebuild':
+            if command == '/index' and argument.split()[:1] == ['rebuild']:
                 if not self.routes:
                     return 'Сначала настрой каналы: /channel @источник @мой_канал'
+                parts = argument.split()
+                if len(parts) > 2 or (len(parts) == 1 and len(self.routes) > 1):
+                    return 'Укажи источник: /index rebuild @канал'
+                sources = await self.selected_sources(parts[1] if len(parts) == 2 else '')
                 self.generation += 1
-                for source in self.routes:
+                for source in sources:
                     self.archive.rebuild_index(source)
-                return '📚 Индекс очищен. Индексация всей истории началась заново; публикация и очередь не изменены.'
+                return '📚 Выбранный источник пересобирается. Остальные тексты общей базы сохранены.'
             if command in ('/post', '/index', '/llm'):
-                if argument not in ('on', 'off'):
+                parts = argument.split()
+                if not parts or parts[0] not in ('on', 'off') or len(parts) > 2 or (command == '/llm' and len(parts) > 1):
                     return ('Используй /index on, /index off или /index rebuild.' if command == '/index'
                             else f'Используй {command} on или {command} off.')
-                enabled = argument == 'on'
+                enabled = parts[0] == 'on'
                 if command == '/llm':
                     await self.set_llm(enabled)
                     return f'🧠 MiniLM {"включена" if enabled else "выключена"}.'
                 if not self.routes:
                     return 'Сначала настрой каналы: /channel @источник @мой_канал'
-                for source, route in self.routes.items():
+                sources = await self.selected_sources(parts[1] if len(parts) == 2 else '')
+                for source in sources:
+                    route = self.routes[source]
                     if command == '/post':
                         if enabled and not self.archive.state(source)['auto_publish']:
                             self.archive.set_posting_cursor(source, await self.telegram.head(route.source))

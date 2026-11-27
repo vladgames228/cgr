@@ -1,4 +1,6 @@
 import json
+import hashlib
+from itertools import islice
 import os
 import secrets
 import sqlite3
@@ -60,6 +62,25 @@ CREATE TABLE IF NOT EXISTS copied_messages (
     published_id INTEGER NOT NULL,
     PRIMARY KEY (source, destination, post)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    peer TEXT NOT NULL,
+    name TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    cursor INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS group_results (
+    group_id INTEGER NOT NULL,
+    post INTEGER NOT NULL,
+    result TEXT NOT NULL,
+    PRIMARY KEY (group_id, post)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS fingerprints (
+    source INTEGER NOT NULL,
+    digest BLOB NOT NULL,
+    PRIMARY KEY (source, digest)
+) WITHOUT ROWID;
 """
 
 
@@ -76,11 +97,23 @@ class Archive:
         self.encoder = encoder
         self._corpus_cache = {}
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('analyzer', analyzer_id))
+        self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('min_words', '3'))
         empty_posts = [(row['source'], row['id']) for row in
                        self.db.execute('SELECT source, id, original FROM posts')
                        if not words(row['original'])]
         self.db.executemany('DELETE FROM posts WHERE source = ? AND id = ?', empty_posts)
+        if not self.db.execute('SELECT 1 FROM fingerprints LIMIT 1').fetchone():
+            self.db.executemany('INSERT OR IGNORE INTO fingerprints VALUES (?, ?)',
+                                ((row['source'], self._fingerprint(row['original'])) for row in
+                                 self.db.execute('SELECT source, original FROM posts WHERE source IN (SELECT id FROM groups)')))
         self.db.commit()
+
+    @staticmethod
+    def _fingerprint(text):
+        return hashlib.blake2b(' '.join(words(text)).encode(), digest_size=16).digest()
+
+    def apply_min_words(self, minimum):
+        self.set_setting('min_words', minimum)
 
     def close(self):
         self.db.close()
@@ -109,8 +142,42 @@ class Archive:
         for row in self.db.execute('SELECT source, peers, active FROM channels'):
             yield row['source'], json.loads(row['peers']), row['active']
 
+    def groups(self):
+        return list(self.db.execute('SELECT * FROM groups WHERE active >= 0 ORDER BY name'))
+
+    def group(self, group_id):
+        return self.db.execute('SELECT * FROM groups WHERE id = ?', (group_id,)).fetchone()
+
+    def save_group(self, group_id, peer, name, user_id, cursor):
+        with self.db as db:
+            db.execute('INSERT INTO groups (id, peer, name, user_id, cursor) VALUES (?, ?, ?, ?, ?) '
+                       'ON CONFLICT(id) DO UPDATE SET peer=excluded.peer, name=excluded.name, '
+                       'user_id=excluded.user_id, active=1',
+                       (group_id, json.dumps(peer), name, user_id, cursor))
+
+    def remove_group(self, group_id):
+        with self.db as db:
+            db.execute('UPDATE groups SET active = -1 WHERE id = ?', (group_id,))
+
+    def group_cursor(self, group_id, post):
+        with self.db as db:
+            db.execute('UPDATE groups SET cursor = MAX(cursor, ?) WHERE id = ?', (post, group_id))
+
+    def group_result(self, group_id, post, result):
+        with self.db as db:
+            db.execute('INSERT OR IGNORE INTO group_results VALUES (?, ?, ?)', (group_id, post, result))
+
+    def recent_group_results(self, group_id, limit=5):
+        return list(self.db.execute('SELECT post, result FROM group_results WHERE group_id = ? '
+                                    'ORDER BY post DESC LIMIT ?', (group_id, limit)))
+
     def state(self, source):
         return self.db.execute('SELECT * FROM channels WHERE source = ?', (source,)).fetchone()
+
+    def remove_route(self, source):
+        with self.db as db:
+            db.execute('DELETE FROM outbox WHERE source = ? AND report_id IS NULL', (source,))
+            db.execute('DELETE FROM channels WHERE source = ?', (source,))
 
     def save_route(self, source, destination, peers, *, active=1):
         old = self.state(source)
@@ -133,9 +200,11 @@ class Archive:
         with self.db as db:
             db.execute('DELETE FROM postings WHERE source = ?', (source,))
             db.execute('DELETE FROM posts WHERE source = ?', (source,))
+            db.execute('DELETE FROM fingerprints WHERE source = ?', (source,))
             db.execute('UPDATE channels SET cursor = 0, snapshot = NULL, history_done = 0, '
                        'scan_count = 0, active = 1 WHERE source = ?', (source,))
         self._corpus_cache.pop(source, None)
+        self._corpus_cache.pop(None, None)
 
     def set_auto_publish(self, source, enabled):
         with self.db as db:
@@ -156,6 +225,7 @@ class Archive:
     def stop_all(self):
         with self.db as db:
             db.execute('UPDATE channels SET active = 0, auto_publish = 0, delivery_enabled = 0')
+            db.execute('UPDATE groups SET active = 0')
 
     def snapshot(self, source, head):
         with self.db as db:
@@ -170,14 +240,14 @@ class Archive:
         if self.state(source)['cursor'] >= post:
             return
         with self.db as db:
-            if original and words(original):
+            if original and len(words(original)) >= int(self.setting('min_words', 3)):
                 self._store_post(source, post, original)
             db.execute('UPDATE channels SET cursor = ?, scan_count = scan_count + 1 WHERE source = ?',
                        (post, source))
 
     def add_reference(self, source, post, original, *, encode=True):
-        if self.state(source) is None:
-            raise ValueError('Канал не настроен')
+        if self.state(source) is None and self.group(source) is None:
+            raise ValueError('Источник не настроен')
         if not original or not words(original):
             raise ValueError('У поста нет слов для индексации')
         with self.db:
@@ -192,17 +262,27 @@ class Archive:
             return False
         if self.db.execute('SELECT 1 FROM posts WHERE source = ? AND id = ?', (source, post)).fetchone():
             return False
+        digest = self._fingerprint(original)
+        if self.group(source) and self.db.execute(
+                'SELECT 1 FROM fingerprints WHERE source = ? AND digest = ?',
+                (source, digest)).fetchone():
+            return False
         packed = serialize(extract(original, self.encoder if encode else None))
         self.db.execute('INSERT INTO posts VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                         (source, post, original, packed, 0, 0, 0, 0))
-        self._corpus_cache.pop(source, None)
+        if self.group(source):
+            self.db.execute('INSERT OR IGNORE INTO fingerprints VALUES (?, ?)', (source, digest))
+        self._corpus_cache.pop(source if self.group(source) else None, None)
         return True
 
     def fill_vectors(self, source, batch_size=4):
         if self.encoder is None:
             return False
         missing = []
-        for row in self.db.execute('SELECT id, original, features FROM posts WHERE source = ?', (source,)):
+        query = ('SELECT source, id, original, features FROM posts WHERE source = ?' if self.group(source)
+                 else 'SELECT source, id, original, features FROM posts WHERE source NOT IN (SELECT id FROM groups)')
+        parameters = (source,) if self.group(source) else ()
+        for row in self.db.execute(query, parameters):
             if words(row['original']) and not deserialize(row['features']).get('vectors'):
                 missing.append(row)
                 if len(missing) == batch_size:
@@ -212,39 +292,57 @@ class Archive:
         with self.db as db:
             for row in missing:
                 db.execute('UPDATE posts SET features = ? WHERE source = ? AND id = ?',
-                           (serialize(extract(row['original'], self.encoder)), source, row['id']))
-        self._corpus_cache.pop(source, None)
+                           (serialize(extract(row['original'], self.encoder)), row['source'], row['id']))
+        self._corpus_cache.pop(source if self.group(source) else None, None)
         return True
 
     def _corpus(self, source):
-        if source not in self._corpus_cache:
-            rows = list(self.db.execute('SELECT id, original, features FROM posts WHERE source = ?', (source,)))
-            self._corpus_cache[source] = (rows, *corpus_counts(rows))
-        return self._corpus_cache[source]
+        key = source if self.group(source) else None
+        if key not in self._corpus_cache:
+            if key is None:
+                all_rows = self.db.execute('SELECT source, id, original, features FROM posts '
+                                           'WHERE source NOT IN (SELECT id FROM groups) ORDER BY source, id')
+                seen = set()
+                rows = []
+                exact = {}
+                for row in all_rows:
+                    digest = self._fingerprint(row['original'])
+                    exact.setdefault(digest, []).append((row['source'], row['id']))
+                    if digest not in seen:
+                        seen.add(digest)
+                        rows.append(row)
+            else:
+                rows = list(self.db.execute('SELECT source, id, original, features FROM posts WHERE source = ?',
+                                            (source,)))
+                exact = {}
+                for row in rows:
+                    exact.setdefault(self._fingerprint(row['original']), []).append((row['source'], row['id']))
+            self._corpus_cache[key] = (rows, *corpus_counts(rows), exact)
+        return self._corpus_cache[key]
 
     def analyze(self, source, text, exclude=None):
-        rows, term_counts, phrase_counts, per_post = self._corpus(source)
-        others = len(rows) - (exclude in per_post)
+        rows, term_counts, phrase_counts, per_post, exact = self._corpus(source)
+        excluded = (source, exclude) if exclude is not None else None
+        others = len(rows) - (excluded in per_post)
         terms = content(text)
         combinations = phrases(terms)
-        owned_terms, owned_phrases = per_post.get(exclude, (set(), set()))
+        owned_terms, owned_phrases = per_post.get(excluded, (set(), set()))
+        for post_key in exact.get(self._fingerprint(text), ()):
+            if post_key != excluded:
+                return {'overall': 0, 'words': 0, 'phrases': 0,
+                        'theme': 0 if self.encoder else None,
+                        'model_pending': False, 'similar_post': post_key, 'similarity': 100}
         if not others:
             return {'overall': 100, 'words': 100, 'phrases': 100, 'theme': None,
                     'model_pending': False, 'similar_post': None, 'similarity': 0}
-        normalized = words(text)
-        for row in rows:
-            if row['id'] != exclude and words(row['original']) == normalized:
-                return {'overall': 0, 'words': 0, 'phrases': 0,
-                        'theme': 0 if self.encoder else None,
-                        'model_pending': False, 'similar_post': row['id'], 'similarity': 100}
         vocabulary = word_novelty(terms, term_counts, owned_terms, others)
         expressions = novelty(combinations, phrase_counts, owned_phrases, others, 1)
         theme, pending = None, False
         if self.encoder:
             pending = any(words(row['original']) and not deserialize(row['features']).get('vectors')
-                          for row in rows if row['id'] != exclude)
+                          for row in rows if (row['source'], row['id']) != excluded)
             if not pending:
-                theme = semantic(extract(text, self.encoder)['vectors'], rows, exclude)
+                theme = semantic(extract(text, self.encoder)['vectors'], rows, excluded)
         measures = [vocabulary, expressions]
         if theme is not None:
             measures.append(theme)
@@ -253,7 +351,7 @@ class Archive:
         similar_post, similarity = None, 0
         if own_words:
             for post, (other_words, other_phrases) in per_post.items():
-                if post == exclude or not other_words:
+                if post == excluded or not other_words:
                     continue
                 word_match = len(own_words & other_words) / len(own_words | other_words)
                 phrase_match = (len(own_phrases & other_phrases) / len(own_phrases | other_phrases)
@@ -266,8 +364,11 @@ class Archive:
                 'similar_post': similar_post, 'similarity': similarity}
 
     def statistics(self, source):
-        rows, terms, expressions, _ = self._corpus(source)
-        return len(rows), terms.most_common(8), expressions.most_common(5)
+        rows, terms, expressions, _, _ = self._corpus(source)
+        useful = ((term, count) for term, count in terms.most_common() if len(term) >= 3)
+        useful_phrases = ((phrase, count) for phrase, count in expressions.most_common()
+                          if count > 1 and all(len(term) >= 3 for term in phrase))
+        return len(rows), list(islice(useful, 8)), list(islice(useful_phrases, 5))
 
     def post_text(self, source, post):
         row = self.db.execute('SELECT original FROM posts WHERE source = ? AND id = ?',

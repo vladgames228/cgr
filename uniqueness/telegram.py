@@ -96,6 +96,21 @@ class Telegram:
         return Route(await self.user.get_input_entity(source),
                      await self.user.get_input_entity(destination))
 
+    async def configure_group(self, reference):
+        if isinstance(reference, str) and reference.startswith('-100') and reference[4:].isdigit():
+            group_id = int(reference[4:])
+            entity = None
+            async for dialog in self.user.iter_dialogs():
+                if isinstance(dialog.entity, types.Channel) and dialog.entity.id == group_id:
+                    entity = dialog.entity
+                    break
+        else:
+            entity = await self.call('user', self.user.get_entity, reference)
+        if not entity or not isinstance(entity, (types.Chat, types.Channel)) or (
+                isinstance(entity, types.Channel) and entity.broadcast):
+            raise ValueError('Группа недоступна твоему аккаунту или это канал')
+        return entity, await self.user.get_input_entity(entity)
+
     async def head(self, source):
         messages = await self.call('user', self.user.get_messages, source, limit=1)
         return messages[0].id if messages else 0

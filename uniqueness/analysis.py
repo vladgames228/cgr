@@ -13,6 +13,7 @@ import snowballstemmer
 WORD = re.compile(r'[^\W_]+', re.UNICODE)
 STOP = set('а и в во на по из к ко за с со о об от до для у я мы вы он она они это как что '
            'чтобы или но если уже же то еще есть меня мне мой наш его ее их те тот там тут '
+           'не да нет ни ну при под без про '
            'the a an is are was were be to of in on for and or that this with as at by it'.split())
 RU = snowballstemmer.stemmer('russian')
 EN = snowballstemmer.stemmer('english')
@@ -90,7 +91,7 @@ def corpus_counts(rows):
         own_terms, own_phrases = set(tokens), set(phrases(tokens))
         terms.update(own_terms)
         combinations.update(own_phrases)
-        per_post[row['id']] = (own_terms, own_phrases)
+        per_post[(row['source'], row['id'])] = (own_terms, own_phrases)
     return terms, combinations, per_post
 
 
@@ -104,7 +105,7 @@ def semantic(query_vectors, rows, excluded=None):
     query /= np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1)
     vectors = []
     for row in rows:
-        if row['id'] == excluded:
+        if ((row['source'] if 'source' in row.keys() else None), row['id']) == excluded:
             continue
         stored = deserialize(row['features']).get('vectors', [])
         vectors.extend(stored)

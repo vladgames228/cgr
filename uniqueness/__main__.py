@@ -41,7 +41,7 @@ async def login(config):
         await user.disconnect()
 
 
-async def schedule(control, operation, idle, name):
+async def schedule(control, operation, idle, name, sources=None):
     ready = {}
     failures = {}
     generation = -1
@@ -50,7 +50,7 @@ async def schedule(control, operation, idle, name):
             generation = control.generation
             ready.clear()
             failures.clear()
-        for source in tuple(control.routes):
+        for source in tuple(sources() if sources else control.routes):
             if ready.get(source, 0) > time.monotonic():
                 continue
             try:
@@ -100,9 +100,11 @@ async def serve(config, check=False):
         try:
             await telegram.call('bot', bot, functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopeDefault(), lang_code='', commands=[
-                    types.BotCommand('channel', 'Источник и мой канал'),
-                    types.BotCommand('post', 'Публикация on/off'),
-                    types.BotCommand('index', 'Индексация on/off/rebuild'),
+                    types.BotCommand('channel', 'Добавить, показать или убрать источник'),
+                    types.BotCommand('group', 'Группы и авторы'),
+                    types.BotCommand('minwords', 'Минимум слов в сообщении'),
+                    types.BotCommand('post', 'Публикация on/off по источнику'),
+                    types.BotCommand('index', 'Индексация on/off/rebuild по источнику'),
                     types.BotCommand('llm', 'MiniLM on/off'),
                     types.BotCommand('status', 'Режимы, прогресс и ошибки'),
                     types.BotCommand('stat', 'Частые слова и выражения'),
@@ -128,6 +130,7 @@ async def serve(config, check=False):
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(warm())
                 tasks.create_task(schedule(control, control.index, poll, 'Чтение'))
+                tasks.create_task(schedule(control, control.watch_group, poll, 'Группы', lambda: control.groups))
                 tasks.create_task(schedule(control, control.watch, poll, 'Новые посты'))
                 tasks.create_task(schedule(control, control.deliver, 2, 'Публикация'))
         except Exception:
