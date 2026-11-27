@@ -75,7 +75,13 @@ async def deliver(archive, telegram, route, should_continue=lambda: True):
         if original is None:
             item = await telegram.call('user', telegram.user.get_messages, route.source, ids=post)
             original = item.message if item else None
-        result = await telegram.send_report(route, forward, job['result'], job['report_random'], original)
+        draft = job['draft_id']
+        if draft is None:
+            draft = await telegram.prepare_report(route, forward, job['result'], job['report_random'], original)
+            archive.update_job(source, post, draft=draft)
+        if not should_continue() or not archive.job_pending(source, post):
+            return False
+        result = await telegram.publish_report(route, draft, job['report_random'])
         archive.update_job(source, post, result=result)
     except Undeliverable as exc:
         archive.update_job(source, post, skipped=str(exc))

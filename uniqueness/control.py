@@ -582,8 +582,8 @@ class Control:
                 try:
                     _, source, post, text, result = offer
                     route = self.routes[source]
-                    random_post, random_report, published = self.post_progress.setdefault(
-                        token, [secrets.randbits(63) or 1, secrets.randbits(63) or 1, None])
+                    random_post, random_report, published, draft = self.post_progress.setdefault(
+                        token, [secrets.randbits(63) or 1, secrets.randbits(63) or 1, None, None])
                     if published is None:
                         if post is None:
                             published = await self.telegram.send_text(route, text, random_post)
@@ -596,7 +596,10 @@ class Control:
                             except Undeliverable:
                                 published = await self.telegram.send_text(route, text, random_post)
                         self.post_progress[token][2] = published
-                    await self.telegram.send_report(route, published, result, random_report, text)
+                    if draft is None:
+                        draft = await self.telegram.prepare_report(route, published, result, random_report, text)
+                        self.post_progress[token][3] = draft
+                    await self.telegram.publish_report(route, draft, random_report)
                     self.posted_offers.add(token)
                     self.post_progress.pop(token, None)
                 finally:

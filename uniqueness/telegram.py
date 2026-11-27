@@ -4,6 +4,7 @@ import time
 
 from telethon import TelegramClient, errors, functions, types
 
+from .analysis import stable_hash
 from .copy_post import send_copy
 from .worker import ForwardRestricted, Incoming, Route, Undeliverable
 
@@ -41,7 +42,8 @@ def sent_id(updates, random_id, target, *, single=True):
     messages = [
         update.message for update in items
         if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage))
-        and update.message.peer_id == types.PeerChannel(target.channel_id)
+        and (isinstance(target, types.InputPeerSelf)
+             or update.message.peer_id == types.PeerChannel(target.channel_id))
     ]
     if single and len(messages) == 1:
         return messages[0].id
@@ -168,7 +170,7 @@ class Telegram:
             raise
         return sent_id(updates, random_id, route.destination)
 
-    async def send_report(self, route, forwarded_post, report, random_id, original=None):
+    async def prepare_report(self, route, forwarded_post, report, random_id, original=None):
         channel_id = route.destination.channel_id
         deadline = self.last_reports.get(channel_id, 0) + REPORT_GAP
         await asyncio.sleep(max(0, deadline - time.monotonic()))
@@ -178,15 +180,27 @@ class Telegram:
             if len((quote + character).encode('utf-8')) > 900:
                 break
             quote += character
+        saved = types.InputPeerSelf()
         reply = types.InputReplyToMessage(reply_to_msg_id=forwarded_post,
+                                          reply_to_peer_id=route.destination,
                                           quote_text=quote or None, quote_offset=0 if quote else None)
         try:
-            updates = await self.call('user', self.user, functions.messages.SendMessageRequest(
-                peer=route.destination, message=report, random_id=random_id, silent=True,
+            draft_random = stable_hash(f'{random_id}:external-quote') or 1
+            draft = await self.call('user', self.user, functions.messages.SendMessageRequest(
+                peer=saved, message=report, random_id=draft_random, silent=True,
                 no_webpage=True, reply_to=reply,
             ))
+            draft_id = sent_id(draft, draft_random, saved)
         except (errors.MsgIdInvalidError, errors.MessageIdInvalidError) as exc:
-            raise Undeliverable('пересланный пост недоступен для цитирования') from exc
+            raise Undeliverable('пост в канале недоступен для цитирования') from exc
+        return draft_id
+
+    async def publish_report(self, route, draft_id, random_id):
+        await self.pace_posts()
+        updates = await self.call('user', self.user, functions.messages.ForwardMessagesRequest(
+            from_peer=types.InputPeerSelf(), id=[draft_id], random_id=[random_id],
+            to_peer=route.destination, drop_author=True, silent=True,
+        ))
         return sent_id(updates, random_id, route.destination)
 
     async def send_text(self, route, text, random_id):

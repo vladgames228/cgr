@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from telethon import functions, types
 
-from uniqueness.analysis import semantic, serialize
+from uniqueness.analysis import semantic, serialize, stable_hash
 from uniqueness.control import Control
 from uniqueness.storage import Archive
 from uniqueness.telegram import Telegram
@@ -117,20 +117,30 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.queue_size(1), 1)
 
         transport = SimpleNamespace(forward=AsyncMock(return_value=41),
-                                    send_report=AsyncMock(return_value=42))
+                                    prepare_report=AsyncMock(return_value=40),
+                                    publish_report=AsyncMock(return_value=42))
         self.assertTrue(await deliver(self.archive, transport, self.route))
-        transport.send_report.assert_awaited_once()
-        self.assertEqual(transport.send_report.await_args.args[1], 41)
-        self.assertEqual(transport.send_report.await_args.args[2], 'Уникальность в канале: 100%')
+        transport.prepare_report.assert_awaited_once()
+        self.assertEqual(transport.prepare_report.await_args.args[1], 41)
+        self.assertEqual(transport.prepare_report.await_args.args[2], 'Уникальность в канале: 100%')
+        transport.publish_report.assert_awaited_once_with(self.route, 40, self.archive.db.execute(
+            'SELECT report_random FROM outbox WHERE source = 1 AND post = 11').fetchone()[0])
         self.assertEqual(self.archive.queue_size(1), 0)
 
-        user = AsyncMock(return_value=SimpleNamespace(updates=[types.UpdateMessageID(id=42, random_id=99)]))
+        draft_random = stable_hash('99:external-quote') or 1
+        user = AsyncMock(side_effect=[SimpleNamespace(updates=[types.UpdateMessageID(id=40, random_id=draft_random)]),
+                                      SimpleNamespace(updates=[types.UpdateMessageID(id=42, random_id=99)])])
         api = Telegram(user, self.archive)
-        self.assertEqual(await api.send_report(self.route, 41, 'Оценка', 99), 42)
-        request = user.await_args.args[0]
+        self.assertEqual(await api.prepare_report(self.route, 41, 'Оценка', 99), 40)
+        request = user.await_args_list[0].args[0]
         self.assertIsInstance(request, functions.messages.SendMessageRequest)
-        self.assertEqual(request.peer, self.route.destination)
+        self.assertIsInstance(request.peer, types.InputPeerSelf)
         self.assertEqual(request.reply_to.reply_to_msg_id, 41)
+        self.assertEqual(request.reply_to.reply_to_peer_id, self.route.destination)
+        self.assertEqual(await api.publish_report(self.route, 40, 99), 42)
+        forwarded = user.await_args_list[1].args[0]
+        self.assertIsInstance(forwarded, functions.messages.ForwardMessagesRequest)
+        self.assertTrue(forwarded.drop_author)
 
     async def test_plain_messages_and_forwards_are_analyzed(self):
         self.archive.index(1, 1, '2025', 'Исходный текст для сравнения.')
@@ -350,7 +360,8 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_post_button_publishes_text_and_report(self):
         telegram = SimpleNamespace(send_text=AsyncMock(return_value=50),
-                                   send_report=AsyncMock(return_value=51))
+                                   prepare_report=AsyncMock(return_value=49),
+                                   publish_report=AsyncMock(return_value=51))
         control = self.control(telegram)
         event = SimpleNamespace(sender_id=100, is_private=True, raw_text='Проверяемый текст.',
                                 message=SimpleNamespace(fwd_from=None), respond=AsyncMock())
@@ -360,8 +371,9 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
                                    answer=AsyncMock())
         await control.handle_button(callback)
         telegram.send_text.assert_awaited_once()
-        telegram.send_report.assert_awaited_once()
-        self.assertEqual(telegram.send_report.await_args.args[1], 50)
+        telegram.prepare_report.assert_awaited_once()
+        telegram.publish_report.assert_awaited_once()
+        self.assertEqual(telegram.prepare_report.await_args.args[1], 50)
         self.assertEqual(self.archive.queue_size(1), 0)
         await control.handle_button(callback)
         self.assertIn('Уже опубликовано', callback.answer.await_args.args[0])
@@ -377,7 +389,8 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         telegram = SimpleNamespace(user=user, call=call,
                                    forward=AsyncMock(side_effect=Undeliverable('удалён')),
                                    send_text=AsyncMock(return_value=50),
-                                   send_report=AsyncMock(return_value=51))
+                                   prepare_report=AsyncMock(return_value=49),
+                                   publish_report=AsyncMock(return_value=51))
         control = self.control(telegram)
         event = SimpleNamespace(sender_id=100, is_private=True,
                                 raw_text='https://t.me/source_channel/10',
@@ -388,7 +401,7 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
                                    answer=AsyncMock())
         await control.handle_button(callback)
         telegram.send_text.assert_awaited_once()
-        self.assertEqual(telegram.send_report.await_args.args[1], 50)
+        self.assertEqual(telegram.prepare_report.await_args.args[1], 50)
 
     async def test_queue_pause_and_clear(self):
         self.archive.enqueue(1, 5, 'Оценка')
@@ -407,9 +420,19 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
             self.archive.clear_queue()
             return 70
 
-        transport = SimpleNamespace(forward=forward, send_report=AsyncMock())
+        transport = SimpleNamespace(forward=forward, prepare_report=AsyncMock(), publish_report=AsyncMock())
         self.assertFalse(await deliver(self.archive, transport, self.route))
-        transport.send_report.assert_not_awaited()
+        transport.prepare_report.assert_not_awaited()
+
+    async def test_saved_report_draft_is_reused_after_retry(self):
+        self.archive.enqueue(1, 7, 'Оценка')
+        self.archive.update_job(1, 7, forward=70, draft=71)
+        transport = SimpleNamespace(prepare_report=AsyncMock(),
+                                    publish_report=AsyncMock(return_value=72))
+        self.assertTrue(await deliver(self.archive, transport, self.route))
+        transport.prepare_report.assert_not_awaited()
+        self.assertEqual(transport.publish_report.await_args.args[1], 71)
+        self.assertEqual(self.archive.queue_size(1), 0)
 
 
 if __name__ == '__main__':

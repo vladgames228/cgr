@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     forward_id INTEGER,
     report_id INTEGER,
     skipped TEXT,
+    draft_id INTEGER,
     PRIMARY KEY (source, post)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(source, post)
@@ -94,6 +95,8 @@ class Archive:
             self.db.close()
             raise ValueError('Старая схема базы. Останови контейнер и очисти archive.sqlite3 перед запуском cgr.')
         self.db.executescript(SCHEMA)
+        if 'draft_id' not in {row['name'] for row in self.db.execute('PRAGMA table_info(outbox)')}:
+            self.db.execute('ALTER TABLE outbox ADD COLUMN draft_id INTEGER')
         self.encoder = encoder
         self._corpus_cache = {}
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('analyzer', analyzer_id))
@@ -404,11 +407,12 @@ class Archive:
         return self.db.execute('SELECT 1 FROM outbox WHERE source = ? AND post = ? '
                                'AND report_id IS NULL AND skipped IS NULL', (source, post)).fetchone() is not None
 
-    def update_job(self, source, post, *, forward=None, result=None, skipped=None):
+    def update_job(self, source, post, *, forward=None, result=None, skipped=None, draft=None):
         with self.db as db:
             db.execute('UPDATE outbox SET forward_id = COALESCE(?, forward_id), '
-                       'report_id = COALESCE(?, report_id), skipped = COALESCE(?, skipped) '
-                       'WHERE source = ? AND post = ?', (forward, result, skipped, source, post))
+                       'report_id = COALESCE(?, report_id), skipped = COALESCE(?, skipped), '
+                       'draft_id = COALESCE(?, draft_id) WHERE source = ? AND post = ?',
+                       (forward, result, skipped, draft, source, post))
 
     def queue_size(self, source):
         return self.db.execute('SELECT count(*) FROM outbox WHERE source = ? AND report_id IS NULL '
