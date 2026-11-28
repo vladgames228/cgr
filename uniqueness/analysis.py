@@ -8,6 +8,7 @@ import unicodedata
 import zlib
 from collections import Counter
 from functools import lru_cache
+from statistics import median
 
 import snowballstemmer
 
@@ -16,6 +17,10 @@ STOP = set('а и в во на по из к ко за с со о об от до 
            'чтобы или но если уже же то еще есть меня мне мой наш его ее их те тот там тут '
            'не да нет ни ну при под без про '
            'the a an is are was were be to of in on for and or that this with as at by it'.split())
+PERSONAL = set('я мне меня мной мой моя мое мои мы нас нам наш наши ты тебя тебе твой вы вас вам '
+               'он она они его ее их ему ей им'.split())
+PROFANITY = re.compile(r'^(?:бля|бляд|еб|ёб|пизд|хуй|хуе|нахуй|сука|сук|мудак|мудил|гандон|'
+                       r'шлюх|долбоеб|долбоёб|охуе|охуе|заеб|заёб)', re.IGNORECASE)
 RU = snowballstemmer.stemmer('russian')
 EN = snowballstemmer.stemmer('english')
 
@@ -114,3 +119,51 @@ def semantic(query_vectors, rows, excluded=None):
     closest = query @ reference.T
     best = closest.max(axis=1)
     return round(100 * np.clip((0.82 - best) / 0.22, 0, 1).mean())
+
+
+def style_features(text):
+    """Topic-free, mostly scale-independent habits of writing."""
+    items = words(text)
+    count = max(1, len(items))
+    sentences = max(1, len(re.findall(r'[.!?…]+', text)))
+    letters = [character for character in text if character.isalpha()]
+    return (
+        sum(word in STOP for word in items) / count,
+        sum(word in PERSONAL for word in items) / count,
+        sum(bool(PROFANITY.match(word)) for word in items) / count,
+        sum(len(word) for word in items) / count,
+        count / sentences,
+        text.count(',') / count,
+        text.count('!') / count,
+        text.count('?') / count,
+        (text.count('…') + text.count('...')) / count,
+        (text.count(':') + text.count(';')) / count,
+        (text.count('—') + text.count('–') + text.count(' - ')) / count,
+        (text.count('(') + text.count(')')) / count,
+        sum(character.isupper() for character in letters) / max(1, len(letters)),
+        len(re.findall(r'(.)\1{2,}', text, re.IGNORECASE)) / count,
+    )
+
+
+def style_profile(rows):
+    """Median and robust spread of an author's posts, per feature."""
+    if len(rows) < 20:
+        return None
+    values = [style_features(row['original']) for row in rows]
+    centers = [median(column) for column in zip(*values)]
+    floors = (.12, .08, .05, 1.2, 8, .08, .06, .06, .05, .06, .06, .06, .04, .05)
+    spreads = [max(floor, 1.4826 * median(abs(value - center) for value in column))
+               for column, center, floor in zip(zip(*values), centers, floors)]
+    return centers, spreads
+
+
+def style_novelty(text, profile):
+    if profile is None or len(words(text)) < 8:
+        return None
+    centers, spreads = profile
+    values = style_features(text)
+    # A few accidental matches in common function words cannot decide the score.
+    weights = (1, 1.5, 2.5, .7, .7, .7, 1, 1, 1, .7, .7, .7, .8, 1.5)
+    distance = sum(weight * min(3, abs(value - center) / spread)
+                   for value, center, spread, weight in zip(values, centers, spreads, weights)) / sum(weights)
+    return round(100 * (1 - math.exp(-1.5 * distance)))

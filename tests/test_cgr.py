@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from telethon import functions, types
 
-from uniqueness.analysis import semantic, serialize, stable_hash
+from uniqueness.analysis import semantic, serialize, stable_hash, style_novelty, style_profile
 from uniqueness.control import Control
 from uniqueness.storage import Archive
 from uniqueness.telegram import Telegram
@@ -40,6 +40,52 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(semantic([[1, 1]], rows), 0)
         self.assertLess(semantic([[1, 1]], rows), 100)
         self.assertEqual(semantic([[0, 1]], rows), 100)
+
+    async def test_style_uses_writing_habits_across_topics(self):
+        rows = [{'original': f'Да бля, опять эта хуйня! Я же тебе говорил... Пост {i}.'}
+                for i in range(30)]
+        profile = style_profile(rows)
+        familiar_style = style_novelty('Да бля, опять эта хуйня! Я же тебе говорил... Про компьютер.', profile)
+        edited_news = style_novelty('В субботу администрация города сообщила о завершении '
+                                    'реконструкции моста.', profile)
+        self.assertLess(familiar_style, edited_news)
+
+    async def test_content_and_style_separate_news_from_author_voice(self):
+        for post in range(1, 31):
+            self.archive.index(1, post, None,
+                               f'Да бля, опять эта хуйня! Я же тебе говорил... '
+                               f'Про мужчин и отношения, пост {post}.')
+
+        class FakeEncoder:
+            identity = 'content-style-test'
+
+            def encode(self, texts):
+                for text in texts:
+                    yield [1, 0] if any(word in text for word in ('мужчин', 'отношен', 'женщин')) else [0, 1]
+
+        self.archive.set_encoder(FakeEncoder())
+        while self.archive.fill_vectors(1):
+            pass
+        same_topic_news = self.archive.analyze(
+            1, 'Эксперты обсудили состояние отношений между мужчинами и женщинами. '
+               'Об этом сообщили на конференции.')
+        new_topic_same_style = self.archive.analyze(
+            1, 'Да бля, опять эта хуйня! Я же тебе говорил... Про компьютеры и интернет.')
+        unrelated_news = self.archive.analyze(
+            1, 'В субботу администрация города сообщила о завершении реконструкции моста.')
+        self.assertLess(same_topic_news['content'], 20)
+        self.assertLess(same_topic_news['content'], unrelated_news['content'])
+        self.assertLess(new_topic_same_style['style'], unrelated_news['style'])
+        self.assertLess(same_topic_news['overall'], unrelated_news['overall'])
+        self.assertLess(new_topic_same_style['overall'], unrelated_news['overall'])
+        control = self.control(SimpleNamespace())
+        sample = 'Да бля, опять эта хуйня! Я же тебе говорил... Про компьютеры и интернет.'
+        normal = control.score_text(1, sample, detailed=True)
+        await control.dispatch('/reverse on')
+        reversed_result = control.score_text(1, sample, detailed=True)
+        self.assertIn(f'Повторяемость в канале: {100 - new_topic_same_style["overall"]}%', reversed_result)
+        self.assertIn(f'Повтор стиля: {100 - new_topic_same_style["style"]}%', reversed_result)
+        self.assertIn(f'Новизна стиля: {new_topic_same_style["style"]}%', normal)
 
     async def test_new_channel_starts_passive_indexing(self):
         fresh = Archive(Path(self.temp.name) / 'fresh.sqlite3')
@@ -203,6 +249,8 @@ class CgrTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Частые основы слов', await control.dispatch('/stat'))
         self.assertIn('ненавиж', await control.dispatch('/stat'))
         await control.dispatch('/reverse on')
+        detailed = control.score_text(1, 'Я ненавижу мужчин', detailed=True)
+        self.assertIn('Повтор содержания:', detailed)
         self.assertEqual(control.score_text(1, 'Документация компилятора.'),
                          'Повторяемость в канале: 0%')
         await control.dispatch('/label Шанс слопа')

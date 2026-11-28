@@ -222,6 +222,19 @@ class Control:
         label = self.archive.setting('label', '') or (f'Повторяемость в {place}' if reverse else f'Уникальность в {place}')
         value = 100 - scores['overall'] if reverse else scores['overall']
         result = f'{label}: {value}%'
+        if detailed:
+            direction = 'Повтор' if reverse else 'Новизна'
+            content = 100 - scores['content'] if reverse else scores['content']
+            result += f'\n{direction} содержания: {content}%'
+            if scores['style'] is not None:
+                style = 100 - scores['style'] if reverse else scores['style']
+                result += f'\n{direction} стиля: {style}%'
+            else:
+                result += '\nСтиль: нужно 8 слов в тексте и 20 образцов в архиве'
+            if scores['model_pending']:
+                result += '\nСмысловая модель ещё обрабатывает архив'
+            elif self.archive.encoder is None:
+                result += '\nСмысл: включи /llm on для сравнения перефразировок'
         if detailed and scores['similarity'] > 60:
             similar_source, post = scores['similar_post']
             name = self.archive.setting(f'route_name:{similar_source}', '').split(' → ', 1)[0]

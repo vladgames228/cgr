@@ -7,7 +7,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from .analysis import content, corpus_counts, deserialize, extract, novelty, phrases, semantic, serialize, word_novelty, words
+from .analysis import (content, corpus_counts, deserialize, extract, novelty, phrases, semantic,
+                       serialize, style_novelty, style_profile, word_novelty, words)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -86,7 +87,7 @@ CREATE TABLE IF NOT EXISTS fingerprints (
 
 
 class Archive:
-    def __init__(self, path: Path, analyzer_id='classic-v1', encoder=None):
+    def __init__(self, path: Path, analyzer_id='content-style-v1', encoder=None):
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;')
@@ -99,7 +100,7 @@ class Archive:
             self.db.execute('ALTER TABLE outbox ADD COLUMN draft_id INTEGER')
         self.encoder = encoder
         self._corpus_cache = {}
-        self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('analyzer', analyzer_id))
+        self.db.execute('INSERT OR REPLACE INTO metadata VALUES (?, ?)', ('analyzer', analyzer_id))
         self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?, ?)', ('min_words', '3'))
         empty_posts = [(row['source'], row['id']) for row in
                        self.db.execute('SELECT source, id, original FROM posts')
@@ -320,11 +321,11 @@ class Archive:
                 exact = {}
                 for row in rows:
                     exact.setdefault(self._fingerprint(row['original']), []).append((row['source'], row['id']))
-            self._corpus_cache[key] = (rows, *corpus_counts(rows), exact)
+            self._corpus_cache[key] = (rows, *corpus_counts(rows), exact, style_profile(rows))
         return self._corpus_cache[key]
 
     def analyze(self, source, text, exclude=None):
-        rows, term_counts, phrase_counts, per_post, exact = self._corpus(source)
+        rows, term_counts, phrase_counts, per_post, exact, profile = self._corpus(source)
         excluded = (source, exclude) if exclude is not None else None
         others = len(rows) - (excluded in per_post)
         terms = content(text)
@@ -333,10 +334,11 @@ class Archive:
         for post_key in exact.get(self._fingerprint(text), ()):
             if post_key != excluded:
                 return {'overall': 0, 'words': 0, 'phrases': 0,
-                        'theme': 0 if self.encoder else None,
+                        'theme': 0 if self.encoder else None, 'content': 0, 'style': 0,
                         'model_pending': False, 'similar_post': post_key, 'similarity': 100}
         if not others:
             return {'overall': 100, 'words': 100, 'phrases': 100, 'theme': None,
+                    'content': 100, 'style': None,
                     'model_pending': False, 'similar_post': None, 'similarity': 0}
         vocabulary = word_novelty(terms, term_counts, owned_terms, others)
         expressions = novelty(combinations, phrase_counts, owned_phrases, others)
@@ -346,13 +348,19 @@ class Archive:
                           for row in rows if (row['source'], row['id']) != excluded)
             if not pending:
                 theme = semantic(extract(text, self.encoder)['vectors'], rows, excluded)
-        overall = round(0.65 * vocabulary + 0.35 * expressions) if theme is None else round(
-            0.5 * vocabulary + 0.3 * expressions + 0.2 * theme)
+        lexical = 0.65 * vocabulary + 0.35 * expressions
+        # A paraphrase should remain a content repeat even when none of its terms match.
+        content_score = round(lexical if theme is None else 0.8 * theme + 0.2 * min(theme, lexical))
+        if excluded is not None and profile is not None:
+            profile = style_profile([row for row in rows if (row['source'], row['id']) != excluded])
+        style_score = style_novelty(text, profile)
+        overall = content_score if style_score is None else round((content_score + style_score) / 2)
         if (terms and len(terms) <= 4
                 and all(term_counts[term] - (term in owned_terms) >= 1 for term in terms)
                 and (not combinations or any(phrase_counts[part] - (part in owned_phrases) >= 1
                                              for part in combinations))):
-            overall = 0
+            content_score = 0
+            overall = 0 if style_score is None else round(style_score / 2)
         own_words, own_phrases = set(terms), set(combinations)
         similar_post, similarity = None, 0
         if own_words:
@@ -366,11 +374,12 @@ class Archive:
                 if match > similarity:
                     similar_post, similarity = post, match
         return {'overall': overall, 'words': vocabulary, 'phrases': expressions,
-                'theme': theme, 'model_pending': pending,
+                'theme': theme, 'content': content_score, 'style': style_score,
+                'model_pending': pending,
                 'similar_post': similar_post, 'similarity': similarity}
 
     def statistics(self, source):
-        rows, terms, expressions, _, _ = self._corpus(source)
+        rows, terms, expressions, _, _, _ = self._corpus(source)
         useful = ((term, count) for term, count in terms.most_common() if len(term) >= 3)
         useful_phrases = ((phrase, count) for phrase, count in expressions.most_common()
                           if count > 1 and all(len(term) >= 3 for term in phrase))
